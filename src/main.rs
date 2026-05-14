@@ -1,11 +1,37 @@
+use clap::Parser;
 use fixedbitset::FixedBitSet;
 use serde::{Deserialize, Serialize};
+use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to load state from
+    #[arg(short, long)]
+    load: Option<String>,
+
+    /// Path to save state to
+    #[arg(short, long)]
+    save: Option<String>,
+
+    /// Path to both load and save state (combination)
+    #[arg(short, long)]
+    checkpoint: Option<String>,
+
+    /// Starting ruler length
+    #[arg(short = 'a', long, default_value_t = 1)]
+    start: u8,
+
+    /// End ruler length
+    #[arg(short = 'z', long, default_value_t = 255)]
+    end: u8,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Solution {
@@ -25,9 +51,6 @@ struct State {
     checkpoint_ruler: Vec<u8>,
     solutions: HashMap<u8, Solution>,
 }
-
-use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
-use std::io::{self, Write};
 
 struct CompactArrayFormatter<'a> {
     inner: PrettyFormatter<'a>,
@@ -115,11 +138,17 @@ impl<'a> Formatter for CompactArrayFormatter<'a> {
     }
 }
 
-fn save_state(state: &State, path: &str) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-    let mut ser = Serializer::with_formatter(writer, CompactArrayFormatter::new());
-    state.serialize(&mut ser).map_err(std::io::Error::other)?;
+fn save_state(state: &State, path: Option<&str>) -> std::io::Result<()> {
+    if let Some(path) = path {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        let mut ser = Serializer::with_formatter(writer, CompactArrayFormatter::new());
+        state.serialize(&mut ser).map_err(std::io::Error::other)?;
+    } else {
+        let mut ser = Serializer::with_formatter(io::stdout(), CompactArrayFormatter::new());
+        state.serialize(&mut ser).map_err(std::io::Error::other)?;
+        println!();
+    }
     Ok(())
 }
 
@@ -179,7 +208,6 @@ fn find_rulers(
     if remaining_segments == 0 {
         current_segments[current_index] = remaining_sum as u8;
         if is_complete(current_segments, length) {
-            println!("{:?}", current_segments);
             found_rulers.push(current_segments.to_vec());
         }
         return found_rulers;
@@ -209,7 +237,7 @@ fn find_rulers(
     found_rulers
 }
 
-fn execute(mut state: State) {
+fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
     let interrupt = Arc::new(AtomicBool::new(true));
     let r = interrupt.clone();
 
@@ -219,7 +247,7 @@ fn execute(mut state: State) {
     })
     .expect("Error setting Ctrl-C handler");
 
-    for i in (state.rulers_solved + 1)..=255 {
+    for i in (state.rulers_solved + 1)..=end_length {
         println!("Solving for length: {}", i);
         let mut num_segments = get_num_segments_lower_bound(i);
         let mut solution = Solution {
@@ -242,12 +270,12 @@ fn execute(mut state: State) {
                 &interrupt,
             );
 
-            if !solution.rulers.is_empty() {
-                solution.num_segments = num_segments;
+            if !interrupt.load(Ordering::SeqCst) {
                 break;
             }
 
-            if !interrupt.load(Ordering::SeqCst) {
+            if !solution.rulers.is_empty() {
+                solution.num_segments = num_segments;
                 break;
             }
 
@@ -262,23 +290,42 @@ fn execute(mut state: State) {
         state.rulers_solved = i;
     }
 
-    save_state(&state, "results.json").expect("Failed to save state");
+    if let Err(e) = save_state(&state, save_path.as_deref()) {
+        let destination = save_path.as_deref().unwrap_or("stdout");
+        eprintln!("Error: Failed to save state to '{}': {}", destination, e);
+        std::process::exit(1);
+    }
 }
 
 fn main() {
-    let state_data = load_state("results.json");
+    let cli = Cli::parse();
 
-    if let Some(state) = state_data {
-        execute(state);
+    let load_path = cli.load.or(cli.checkpoint.clone());
+    let save_path = cli.save.or(cli.checkpoint);
+
+    let mut state = if let Some(path) = load_path {
+        load_state(&path).unwrap_or_else(|| {
+            eprintln!(
+                "Error: Failed to load state from '{}'. The file may not exist or is invalid.",
+                path
+            );
+            std::process::exit(1);
+        })
     } else {
-        let state = State {
-            rulers_solved: 2,
+        State {
+            rulers_solved: 0,
             total_rulers_evaluated: 0,
             total_clock_time: Duration::ZERO,
             total_cpu_time: Duration::ZERO,
             checkpoint_ruler: vec![],
             solutions: HashMap::new(),
-        };
-        execute(state);
+        }
+    };
+
+    // If start is provided, skip already solved rulers up to start - 1
+    if cli.start > state.rulers_solved + 1 {
+        state.rulers_solved = cli.start - 1;
     }
+
+    execute(state, save_path, cli.end);
 }
