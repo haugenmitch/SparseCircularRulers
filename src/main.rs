@@ -1,4 +1,5 @@
 use clap::Parser;
+use cpu_time::ProcessTime;
 use fixedbitset::FixedBitSet;
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
@@ -7,7 +8,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -193,54 +194,52 @@ fn is_complete(segments: &[u8], total_length: u8) -> bool {
     measurable_lengths.count_ones(..) == total_length as usize - 1
 }
 
-fn find_rulers(
-    length: u8,
-    num_segments: u8,
-    current_segments: &mut [u8],
-    current_index: usize,
-    remaining_sum: usize,
-    interrupt: &Arc<AtomicBool>,
-) -> Vec<Vec<u8>> {
-    let mut found_rulers = Vec::new();
-
-    if !interrupt.load(Ordering::SeqCst) {
-        return found_rulers;
-    }
-
-    // Remaining segments, not including the current segment
-    let remaining_segments = num_segments.saturating_sub(current_index as u8 + 1);
-
-    // Check if this is the last segment
-    if remaining_segments == 0 {
-        current_segments[current_index] = remaining_sum as u8;
-        if is_complete(current_segments, length) {
-            found_rulers.push(current_segments.to_vec());
-        }
-        return found_rulers;
-    }
-
-    // Leave at least 1 for each remaining segment (the last segment should be at least 2)
-    // This is because there should be no trailing ones. Any ruler with trailing ones
-    // could be shifted so the first trailing one becomes the first one of the ruler.
-    let max_curr_segment_size = remaining_sum.saturating_sub(remaining_segments as usize + 1);
-
-    for i in 1..=max_curr_segment_size {
-        current_segments[current_index] = i as u8;
-        found_rulers.extend(find_rulers(
-            length,
-            num_segments,
-            current_segments,
-            current_index + 1,
-            remaining_sum - i,
-            interrupt,
-        ));
-
+impl Solution {
+    fn find_rulers(
+        &mut self,
+        length: u8,
+        current_segments: &mut [u8],
+        current_index: usize,
+        remaining_sum: usize,
+        interrupt: &AtomicBool,
+    ) {
         if !interrupt.load(Ordering::SeqCst) {
-            break;
+            return;
+        }
+
+        // Remaining segments, not including the current segment
+        let remaining_segments = self.num_segments.saturating_sub(current_index as u8 + 1);
+
+        // Check if this is the last segment
+        if remaining_segments == 0 {
+            self.total_rulers_evaluated += 1;
+            current_segments[current_index] = remaining_sum as u8;
+            if is_complete(current_segments, length) {
+                self.rulers.push(current_segments.to_vec());
+            }
+            return;
+        }
+
+        // Leave at least 1 for each remaining segment (the last segment should be at least 2)
+        // This is because there should be no trailing ones. Any ruler with trailing ones
+        // could be shifted so the first trailing one becomes the first one of the ruler.
+        let max_curr_segment_size = remaining_sum.saturating_sub(remaining_segments as usize + 1);
+
+        for i in 1..=max_curr_segment_size {
+            current_segments[current_index] = i as u8;
+            self.find_rulers(
+                length,
+                current_segments,
+                current_index + 1,
+                remaining_sum - i,
+                interrupt,
+            );
+
+            if !interrupt.load(Ordering::SeqCst) {
+                break;
+            }
         }
     }
-
-    found_rulers
 }
 
 fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
@@ -256,20 +255,24 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
     for i in (state.rulers_solved + 1)..=end_length {
         println!("Solving for length: {}", i);
         let mut num_segments = get_num_segments_lower_bound(i);
-        let mut solution = Solution {
-            num_segments: 0,
-            rulers: vec![],
-            total_rulers_evaluated: 0,
-            total_clock_time: Duration::ZERO,
-            total_cpu_time: Duration::ZERO,
-        };
+        let mut solution;
+
+        let length_clock_start = Instant::now();
+        let length_cpu_start = ProcessTime::now();
 
         loop {
+            solution = Solution {
+                num_segments,
+                rulers: vec![],
+                total_rulers_evaluated: 0,
+                total_clock_time: Duration::ZERO,
+                total_cpu_time: Duration::ZERO,
+            };
+
             let mut starting_ruler = vec![0; num_segments as usize];
             starting_ruler[0] = 1;
-            solution.rulers = find_rulers(
+            solution.find_rulers(
                 i,
-                num_segments,
                 &mut starting_ruler,
                 1,
                 (i - 1) as usize,
@@ -281,7 +284,6 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
             }
 
             if !solution.rulers.is_empty() {
-                solution.num_segments = num_segments;
                 break;
             }
 
@@ -291,6 +293,13 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
         if !interrupt.load(Ordering::SeqCst) {
             break;
         }
+
+        solution.total_clock_time = length_clock_start.elapsed();
+        solution.total_cpu_time = length_cpu_start.elapsed();
+
+        state.total_rulers_evaluated += solution.total_rulers_evaluated;
+        state.total_clock_time += solution.total_clock_time;
+        state.total_cpu_time += solution.total_cpu_time;
 
         state.solutions.insert(i, solution);
         state.rulers_solved = i;
