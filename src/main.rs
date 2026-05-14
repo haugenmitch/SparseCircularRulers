@@ -22,7 +22,7 @@ struct Cli {
 
     /// Path to both load and save state (combination)
     #[arg(short, long)]
-    checkpoint: Option<String>,
+    resume: Option<String>,
 
     /// Starting ruler length
     #[arg(short = 'a', long, default_value_t = 1)]
@@ -44,12 +44,18 @@ struct Solution {
 
 #[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(default = "default_version")]
+    version: String,
     rulers_solved: u8,
     total_rulers_evaluated: u64,
     total_clock_time: Duration,
     total_cpu_time: Duration,
     checkpoint_ruler: Vec<u8>,
     solutions: HashMap<u8, Solution>,
+}
+
+fn default_version() -> String {
+    "0.0.0".to_string()
 }
 
 struct CompactArrayFormatter<'a> {
@@ -300,19 +306,41 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
 fn main() {
     let cli = Cli::parse();
 
-    let load_path = cli.load.or(cli.checkpoint.clone());
-    let save_path = cli.save.or(cli.checkpoint);
+    let load_path = cli.load.or(cli.resume.clone());
+    let save_path = cli.save.or(cli.resume);
+
+    let current_version = env!("CARGO_PKG_VERSION");
 
     let mut state = if let Some(path) = load_path {
-        load_state(&path).unwrap_or_else(|| {
+        let mut loaded_state = load_state(&path).unwrap_or_else(|| {
             eprintln!(
                 "Error: Failed to load state from '{}'. The file may not exist or is invalid.",
                 path
             );
             std::process::exit(1);
-        })
+        });
+
+        if loaded_state.version != current_version {
+            eprintln!(
+                "Warning: The save file version ({}) differs from the program version ({}).",
+                loaded_state.version, current_version
+            );
+            eprintln!("Save files from different versions may not be compatible.");
+            print!("Would you like to proceed with loading? (y/N): ");
+            io::stdout().flush().unwrap();
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Loading cancelled.");
+                std::process::exit(0);
+            }
+            loaded_state.version = current_version.to_string();
+        }
+        loaded_state
     } else {
         State {
+            version: current_version.to_string(),
             rulers_solved: 0,
             total_rulers_evaluated: 0,
             total_clock_time: Duration::ZERO,
