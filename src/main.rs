@@ -26,10 +26,94 @@ struct State {
     solutions: HashMap<u8, Solution>,
 }
 
+use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
+use std::io::{self, Write};
+
+struct CompactArrayFormatter<'a> {
+    inner: PrettyFormatter<'a>,
+    depth: usize,
+}
+
+impl<'a> CompactArrayFormatter<'a> {
+    fn new() -> Self {
+        Self {
+            inner: PrettyFormatter::with_indent(b"  "),
+            depth: 0,
+        }
+    }
+}
+
+impl<'a> Formatter for CompactArrayFormatter<'a> {
+    fn begin_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.depth += 1;
+        if self.depth > 1 {
+            writer.write_all(b"[")
+        } else {
+            self.inner.begin_array(writer)
+        }
+    }
+
+    fn end_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let res = if self.depth > 1 {
+            writer.write_all(b"]")
+        } else {
+            self.inner.end_array(writer)
+        };
+        self.depth -= 1;
+        res
+    }
+
+    fn begin_array_value<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+        if self.depth > 1 {
+            if !first {
+                writer.write_all(b", ")?;
+            }
+            Ok(())
+        } else {
+            self.inner.begin_array_value(writer, first)
+        }
+    }
+
+    fn end_array_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.depth > 1 {
+            Ok(())
+        } else {
+            self.inner.end_array_value(writer)
+        }
+    }
+
+    fn begin_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.inner.begin_object(writer)
+    }
+
+    fn end_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.inner.end_object(writer)
+    }
+
+    fn begin_object_key<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+        self.inner.begin_object_key(writer, first)
+    }
+
+    fn end_object_key<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.inner.end_object_key(writer)
+    }
+
+    fn begin_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.inner.begin_object_value(writer)
+    }
+
+    fn end_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.inner.end_object_value(writer)
+    }
+}
+
 fn save_state(state: &State, path: &str) -> std::io::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, state)?;
+    let mut ser = Serializer::with_formatter(writer, CompactArrayFormatter::new());
+    state
+        .serialize(&mut ser)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     Ok(())
 }
 
