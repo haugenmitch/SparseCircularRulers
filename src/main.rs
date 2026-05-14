@@ -63,7 +63,11 @@ impl<'a> Formatter for CompactArrayFormatter<'a> {
         res
     }
 
-    fn begin_array_value<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+    fn begin_array_value<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
         if self.depth > 1 {
             if !first {
                 writer.write_all(b", ")?;
@@ -90,7 +94,11 @@ impl<'a> Formatter for CompactArrayFormatter<'a> {
         self.inner.end_object(writer)
     }
 
-    fn begin_object_key<W: ?Sized + Write>(&mut self, writer: &mut W, first: bool) -> io::Result<()> {
+    fn begin_object_key<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
         self.inner.begin_object_key(writer, first)
     }
 
@@ -111,9 +119,7 @@ fn save_state(state: &State, path: &str) -> std::io::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
     let mut ser = Serializer::with_formatter(writer, CompactArrayFormatter::new());
-    state
-        .serialize(&mut ser)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    state.serialize(&mut ser).map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -131,7 +137,7 @@ fn load_state(path: &str) -> Option<State> {
 /// segments for a sparse ruler. In other words,
 /// n = ceil((sqrt(4l - 3) + 1) / 2)
 fn get_num_segments_lower_bound(length: u8) -> u8 {
-    ((((length * 4 - 3) as f64).sqrt() + 1.0) / 2.0).ceil() as u8
+    (((length as f64 * 4.0 - 3.0).sqrt() + 1.0) / 2.0).ceil() as u8
 }
 
 fn is_complete(segments: &[u8], total_length: u8) -> bool {
