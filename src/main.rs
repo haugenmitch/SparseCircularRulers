@@ -40,6 +40,7 @@ struct Solution {
     completed: bool,
     num_segments: u8,
     rulers: Vec<Vec<u8>>,
+    rulers_found: u64,
     total_rulers_evaluated: u64,
     total_clock_time: Duration,
     total_cpu_time: Duration,
@@ -49,7 +50,8 @@ struct Solution {
 struct State {
     #[serde(default = "default_version")]
     version: String,
-    rulers_solved: u8,
+    lengths_solved: u8,
+    total_rulers_found: u64,
     total_rulers_evaluated: u64,
     total_clock_time: Duration,
     total_cpu_time: Duration,
@@ -60,16 +62,18 @@ struct State {
 impl State {
     fn recalculate_global_metrics(&mut self) {
         self.total_rulers_evaluated = 0;
+        self.total_rulers_found = 0;
         self.total_clock_time = Duration::ZERO;
         self.total_cpu_time = Duration::ZERO;
-        self.rulers_solved = 0;
+        self.lengths_solved = 0;
 
         for solution in self.solutions.values() {
             if solution.completed {
                 self.total_rulers_evaluated += solution.total_rulers_evaluated;
+                self.total_rulers_found += solution.rulers_found;
                 self.total_clock_time += solution.total_clock_time;
                 self.total_cpu_time += solution.total_cpu_time;
-                self.rulers_solved += 1;
+                self.lengths_solved += 1;
             }
         }
     }
@@ -291,6 +295,7 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
                 completed: false,
                 num_segments,
                 rulers: vec![],
+                rulers_found: 0,
                 total_rulers_evaluated: 0,
                 total_clock_time: Duration::ZERO,
                 total_cpu_time: Duration::ZERO,
@@ -306,6 +311,7 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
 
             if !solution.rulers.is_empty() {
                 solution.completed = true;
+                solution.rulers_found = solution.rulers.len() as u64;
                 break;
             }
 
@@ -368,7 +374,8 @@ fn main() {
     } else {
         State {
             version: current_version.to_string(),
-            rulers_solved: 0,
+            lengths_solved: 0,
+            total_rulers_found: 0,
             total_rulers_evaluated: 0,
             total_clock_time: Duration::ZERO,
             total_cpu_time: Duration::ZERO,
