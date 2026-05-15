@@ -36,6 +36,8 @@ struct Cli {
 
 #[derive(Serialize, Deserialize)]
 struct Solution {
+    #[serde(default)]
+    completed: bool,
     num_segments: u8,
     rulers: Vec<Vec<u8>>,
     total_rulers_evaluated: u64,
@@ -53,6 +55,24 @@ struct State {
     total_cpu_time: Duration,
     checkpoint_ruler: Vec<u8>,
     solutions: HashMap<u8, Solution>,
+}
+
+impl State {
+    fn recalculate_global_metrics(&mut self) {
+        self.total_rulers_evaluated = 0;
+        self.total_clock_time = Duration::ZERO;
+        self.total_cpu_time = Duration::ZERO;
+        self.rulers_solved = 0;
+
+        for solution in self.solutions.values() {
+            if solution.completed {
+                self.total_rulers_evaluated += solution.total_rulers_evaluated;
+                self.total_clock_time += solution.total_clock_time;
+                self.total_cpu_time += solution.total_cpu_time;
+                self.rulers_solved += 1;
+            }
+        }
+    }
 }
 
 fn default_version() -> String {
@@ -242,7 +262,7 @@ impl Solution {
     }
 }
 
-fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
+fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_length: u8) {
     let interrupt = Arc::new(AtomicBool::new(true));
     let r = interrupt.clone();
 
@@ -252,7 +272,13 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
     })
     .expect("Error setting Ctrl-C handler");
 
-    for i in (state.rulers_solved + 1)..=end_length {
+    for i in start_length..=end_length {
+        if let Some(sol) = state.solutions.get(&i) {
+            if sol.completed {
+                continue;
+            }
+        }
+
         println!("Solving for length: {}", i);
         let mut num_segments = get_num_segments_lower_bound(i);
         let mut solution;
@@ -262,6 +288,7 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
 
         loop {
             solution = Solution {
+                completed: false,
                 num_segments,
                 rulers: vec![],
                 total_rulers_evaluated: 0,
@@ -271,19 +298,14 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
 
             let mut starting_ruler = vec![0; num_segments as usize];
             starting_ruler[0] = 1;
-            solution.find_rulers(
-                i,
-                &mut starting_ruler,
-                1,
-                (i - 1) as usize,
-                &interrupt,
-            );
+            solution.find_rulers(i, &mut starting_ruler, 1, (i - 1) as usize, &interrupt);
 
             if !interrupt.load(Ordering::SeqCst) {
                 break;
             }
 
             if !solution.rulers.is_empty() {
+                solution.completed = true;
                 break;
             }
 
@@ -297,12 +319,8 @@ fn execute(mut state: State, save_path: Option<String>, end_length: u8) {
         solution.total_clock_time = length_clock_start.elapsed();
         solution.total_cpu_time = length_cpu_start.elapsed();
 
-        state.total_rulers_evaluated += solution.total_rulers_evaluated;
-        state.total_clock_time += solution.total_clock_time;
-        state.total_cpu_time += solution.total_cpu_time;
-
         state.solutions.insert(i, solution);
-        state.rulers_solved = i;
+        state.recalculate_global_metrics();
     }
 
     if let Err(e) = save_state(&state, save_path.as_deref()) {
@@ -359,10 +377,18 @@ fn main() {
         }
     };
 
-    // If start is provided, skip already solved rulers up to start - 1
-    if cli.start > state.rulers_solved + 1 {
-        state.rulers_solved = cli.start - 1;
-    }
+    state.recalculate_global_metrics();
 
-    execute(state, save_path, cli.end);
+    let start_length = if cli.start >= 1 {
+        cli.start
+    } else {
+        // If not specified, start from the first uncompleted length
+        let mut i = 1;
+        while state.solutions.get(&i).map_or(false, |s| s.completed) {
+            i += 1;
+        }
+        i
+    };
+
+    execute(state, save_path, start_length, cli.end);
 }
