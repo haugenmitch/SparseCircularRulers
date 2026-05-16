@@ -55,7 +55,6 @@ struct State {
     total_rulers_evaluated: u64,
     total_clock_time: Duration,
     total_cpu_time: Duration,
-    checkpoint_ruler: Vec<u8>,
     solutions: HashMap<u8, Solution>,
 }
 
@@ -379,7 +378,6 @@ fn main() {
             total_rulers_evaluated: 0,
             total_clock_time: Duration::ZERO,
             total_cpu_time: Duration::ZERO,
-            checkpoint_ruler: vec![],
             solutions: HashMap::new(),
         }
     };
