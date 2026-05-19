@@ -200,20 +200,28 @@ fn get_num_segments_lower_bound(length: u8) -> u8 {
 }
 
 fn is_complete(segments: &[u8], total_length: u8) -> bool {
-    // Create a bit set of ruler length - 1
+    let n = segments.len();
     let mut measurable_lengths = FixedBitSet::with_capacity(total_length as usize);
+    let mut sums = vec![0u16; n];
 
-    // Add each possible length to the bit set
-    for i in 0..segments.len() {
-        let mut len: u16 = segments[i] as u16;
-        measurable_lengths.insert(len as usize);
-        for j in 1..(segments.len() - 1) {
-            len += segments[(i + j) % segments.len()] as u16;
-            measurable_lengths.insert(len as usize);
+    // Iteratively calculate sums of k segments (from k=1 to n-1)
+    for k in 1..n {
+        for i in 0..n {
+            // Update the sum at index i to include the next successive segment
+            sums[i] += segments[(i + k - 1) % n] as u16;
+
+            measurable_lengths.insert(sums[i] as usize);
+        }
+
+        // Early Exit Optimization:
+        // Since all segments are >= 1, any contiguous sum of k segments must be
+        // at least k. If we haven't found length 'k' by now, we never will.
+        if !measurable_lengths.contains(k) {
+            return false;
         }
     }
 
-    // Check if every length has been set
+    // Final check to ensure every length from 1 to total_length-1 is measurable.
     measurable_lengths.count_ones(..) == total_length as usize - 1
 }
 
@@ -276,10 +284,8 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
     .expect("Error setting Ctrl-C handler");
 
     for i in start_length..=end_length {
-        if let Some(sol) = state.solutions.get(&i) {
-            if sol.completed {
-                continue;
-            }
+        if state.solutions.get(&i).is_some_and(|s| s.completed) {
+            continue;
         }
 
         println!("Solving for length: {}", i);
@@ -389,7 +395,7 @@ fn main() {
     } else {
         // If not specified, start from the first uncompleted length
         let mut i = 1;
-        while state.solutions.get(&i).map_or(false, |s| s.completed) {
+        while state.solutions.get(&i).is_some_and(|s| s.completed) {
             i += 1;
         }
         i
