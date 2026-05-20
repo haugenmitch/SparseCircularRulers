@@ -6,8 +6,8 @@ use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -226,48 +226,75 @@ fn is_complete(segments: &[u8], total_length: u8) -> bool {
 }
 
 impl Solution {
-    fn find_rulers(
-        &mut self,
-        length: u8,
-        current_segments: &mut [u8],
-        current_index: usize,
-        remaining_sum: usize,
-        interrupt: &AtomicBool,
-    ) {
-        if !interrupt.load(Ordering::SeqCst) {
-            return;
-        }
+    /// Systematically generates and evaluates all possible sparse ruler configurations
+    /// for a given length and number of segments.
+    ///
+    /// This method uses an iterative partition-generation algorithm (similar to an odometer).
+    /// It keeps the first segment fixed at 1 and explores all other combinations of segment
+    /// lengths that sum up to the target length.
+    fn find_rulers(&mut self, length: u8, starting_ruler: Option<Vec<u8>>, interrupt: &AtomicBool) {
+        let n = self.num_segments as usize;
 
-        // Remaining segments, not including the current segment
-        let remaining_segments = self.num_segments.saturating_sub(current_index as u8 + 1);
+        // Initialize the ruler configuration.
+        // If no starting ruler is provided, start with the most "right-heavy" configuration:
+        // [1, 1, 1, ..., (length - (n-1))]
+        let mut ruler = if let Some(r) = starting_ruler {
+            r
+        } else {
+            let mut r = vec![1u8; n];
+            r[n - 1] = length - (n as u8 - 1);
+            r
+        };
 
-        // Check if this is the last segment
-        if remaining_segments == 0 {
-            self.total_rulers_evaluated += 1;
-            current_segments[current_index] = remaining_sum as u8;
-            if is_complete(current_segments, length) {
-                self.rulers.push(current_segments.to_vec());
-            }
-            return;
-        }
-
-        // Leave at least 1 for each remaining segment (the last segment should be at least 2)
-        // This is because there should be no trailing ones. Any ruler with trailing ones
-        // could be shifted so the first trailing one becomes the first one of the ruler.
-        let max_curr_segment_size = remaining_sum.saturating_sub(remaining_segments as usize + 1);
-
-        for i in 1..=max_curr_segment_size {
-            current_segments[current_index] = i as u8;
-            self.find_rulers(
-                length,
-                current_segments,
-                current_index + 1,
-                remaining_sum - i,
-                interrupt,
-            );
-
+        loop {
+            // Check for external interrupt (Ctrl-C)
             if !interrupt.load(Ordering::SeqCst) {
-                break;
+                return;
+            }
+
+            self.total_rulers_evaluated += 1;
+
+            // Check if current configuration can measure all lengths
+            if is_complete(&ruler, length) {
+                self.rulers.push(ruler.clone());
+            }
+
+            // --- Permutation Logic (Moving from right to left) ---
+
+            // If the last segment has "weight" to give, move it to the neighbor on the left
+            if ruler[n - 1] > 1 {
+                ruler[n - 1] -= 1;
+                ruler[n - 2] += 1;
+            } else {
+                // If the last segment is 1, we must "carry" the weight further left.
+                // We look for the first segment from the right (excluding index 0) that is > 1.
+                let mut all_attempted = false;
+                for i in (1..n - 1).rev() {
+                    if i == 1 {
+                        // If we reach index 1 and it's already exhausted (can't be incremented
+                        // without affecting index 0), then all permutations are done.
+                        all_attempted = true;
+                        break;
+                    }
+
+                    if ruler[i] == 1 {
+                        // Keep moving left
+                        continue;
+                    } else {
+                        // Found a segment to decrement.
+                        // Reset this segment to 1, increment its left neighbor,
+                        // and put all remaining weight back into the far right segment.
+                        ruler[i] = 1;
+                        ruler[i - 1] += 1;
+                        let current_sum: u16 = ruler[0..n - 1].iter().map(|&x| x as u16).sum();
+                        ruler[n - 1] = length - (current_sum as u8);
+                        break;
+                    }
+                }
+
+                if all_attempted {
+                    break;
+                }
             }
         }
     }
@@ -306,9 +333,7 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
                 total_cpu_time: Duration::ZERO,
             };
 
-            let mut starting_ruler = vec![0; num_segments as usize];
-            starting_ruler[0] = 1;
-            solution.find_rulers(i, &mut starting_ruler, 1, (i - 1) as usize, &interrupt);
+            solution.find_rulers(i, None, &interrupt);
 
             if !interrupt.load(Ordering::SeqCst) {
                 break;
