@@ -6,8 +6,8 @@ use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -40,10 +40,18 @@ struct Solution {
     completed: bool,
     num_segments: u8,
     rulers: Vec<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_ruler: Option<Vec<u8>>,
     rulers_found: u64,
     total_rulers_evaluated: u64,
     total_clock_time: Duration,
     total_cpu_time: Duration,
+}
+
+#[derive(PartialEq)]
+enum SearchStatus {
+    Finished,
+    Interrupted,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +81,130 @@ impl State {
                 self.total_clock_time += solution.total_clock_time;
                 self.total_cpu_time += solution.total_cpu_time;
                 self.lengths_solved += 1;
+            }
+        }
+    }
+
+    /// Systematically generates and evaluates all possible sparse ruler configurations
+    /// for a given length and number of segments.
+    ///
+    /// This method uses an iterative partition-generation algorithm (similar to an odometer).
+    /// It keeps the first segment fixed at 1 and explores all other combinations of segment
+    /// lengths that sum up to the target length.
+    fn find_rulers(
+        &mut self,
+        length: u8,
+        num_segments: u8,
+        save_path: Option<&str>,
+        interrupt: &AtomicBool,
+    ) -> SearchStatus {
+        let n = num_segments as usize;
+
+        // Ensure we have a solution entry and get the starting configuration
+        let mut ruler = {
+            let solution = self.solutions.entry(length).or_insert(Solution {
+                completed: false,
+                num_segments,
+                rulers: vec![],
+                checkpoint_ruler: None,
+                rulers_found: 0,
+                total_rulers_evaluated: 0,
+                total_clock_time: Duration::ZERO,
+                total_cpu_time: Duration::ZERO,
+            });
+
+            if let Some(r) = solution.checkpoint_ruler.take() {
+                r
+            } else {
+                let mut r = vec![1u8; n];
+                r[n - 1] = length - (n as u8 - 1);
+                r
+            }
+        };
+
+        let mut local_evals = 0;
+        const CHECKPOINT_INTERVAL: u64 = 1_000_000;
+        let mut length_clock_start = Instant::now();
+        let mut length_cpu_start = ProcessTime::now();
+
+        loop {
+            // Check for external interrupt (Ctrl-C)
+            if !interrupt.load(Ordering::SeqCst) {
+                let solution = self.solutions.get_mut(&length).unwrap();
+                solution.checkpoint_ruler = Some(ruler);
+                solution.total_clock_time += length_clock_start.elapsed();
+                solution.total_cpu_time += length_cpu_start.elapsed();
+                self.recalculate_global_metrics();
+                return SearchStatus::Interrupted;
+            }
+
+            // Perform evaluation
+            {
+                let solution = self.solutions.get_mut(&length).unwrap();
+                solution.total_rulers_evaluated += 1;
+                if is_complete(&ruler, length) {
+                    solution.rulers.push(ruler.clone());
+                    solution.rulers_found = solution.rulers.len() as u64;
+                }
+            }
+
+            local_evals += 1;
+
+            // Periodic Checkpoint - Save while continuing
+            if local_evals >= CHECKPOINT_INTERVAL {
+                let solution = self.solutions.get_mut(&length).unwrap();
+                solution.checkpoint_ruler = Some(ruler.clone());
+                solution.total_clock_time += length_clock_start.elapsed();
+                solution.total_cpu_time += length_cpu_start.elapsed();
+
+                self.recalculate_global_metrics();
+                let _ = save_state(self, save_path);
+
+                // Reset chunk timers and local counter
+                length_clock_start = Instant::now();
+                length_cpu_start = ProcessTime::now();
+                local_evals = 0;
+            }
+
+            // --- Permutation Logic (Moving from right to left) ---
+
+            // If the last segment has "weight" to give, move it to the neighbor on the left
+            if ruler[n - 1] > 1 {
+                ruler[n - 1] -= 1;
+                ruler[n - 2] += 1;
+            } else {
+                // If the last segment is 1, we must "carry" the weight further left.
+                // We look for the first segment from the right (excluding index 0) that is > 1.
+                let mut all_attempted = false;
+                for i in (1..n - 1).rev() {
+                    if i == 1 {
+                        // If we reach index 1 and it's already exhausted (can't be incremented
+                        // without affecting index 0), then all permutations are done.
+                        all_attempted = true;
+                        break;
+                    }
+                    if ruler[i] == 1 {
+                        // Keep moving left
+                        continue;
+                    } else {
+                        // Found a segment to decrement.
+                        // Reset this segment to 1, increment its left neighbor,
+                        // and put all remaining weight back into the far right segment.
+                        ruler[i] = 1;
+                        ruler[i - 1] += 1;
+                        let current_sum: u16 = ruler[0..n - 1].iter().map(|&x| x as u16).sum();
+                        ruler[n - 1] = length - (current_sum as u8);
+                        break;
+                    }
+                }
+
+                if all_attempted {
+                    let solution = self.solutions.get_mut(&length).unwrap();
+                    solution.checkpoint_ruler = None;
+                    solution.total_clock_time += length_clock_start.elapsed();
+                    solution.total_cpu_time += length_cpu_start.elapsed();
+                    return SearchStatus::Finished;
+                }
             }
         }
     }
@@ -225,81 +357,6 @@ fn is_complete(segments: &[u8], total_length: u8) -> bool {
     measurable_lengths.count_ones(..) == total_length as usize - 1
 }
 
-impl Solution {
-    /// Systematically generates and evaluates all possible sparse ruler configurations
-    /// for a given length and number of segments.
-    ///
-    /// This method uses an iterative partition-generation algorithm (similar to an odometer).
-    /// It keeps the first segment fixed at 1 and explores all other combinations of segment
-    /// lengths that sum up to the target length.
-    fn find_rulers(&mut self, length: u8, starting_ruler: Option<Vec<u8>>, interrupt: &AtomicBool) {
-        let n = self.num_segments as usize;
-
-        // Initialize the ruler configuration.
-        // If no starting ruler is provided, start with the most "right-heavy" configuration:
-        // [1, 1, 1, ..., (length - (n-1))]
-        let mut ruler = if let Some(r) = starting_ruler {
-            r
-        } else {
-            let mut r = vec![1u8; n];
-            r[n - 1] = length - (n as u8 - 1);
-            r
-        };
-
-        loop {
-            // Check for external interrupt (Ctrl-C)
-            if !interrupt.load(Ordering::SeqCst) {
-                return;
-            }
-
-            self.total_rulers_evaluated += 1;
-
-            // Check if current configuration can measure all lengths
-            if is_complete(&ruler, length) {
-                self.rulers.push(ruler.clone());
-            }
-
-            // --- Permutation Logic (Moving from right to left) ---
-
-            // If the last segment has "weight" to give, move it to the neighbor on the left
-            if ruler[n - 1] > 1 {
-                ruler[n - 1] -= 1;
-                ruler[n - 2] += 1;
-            } else {
-                // If the last segment is 1, we must "carry" the weight further left.
-                // We look for the first segment from the right (excluding index 0) that is > 1.
-                let mut all_attempted = false;
-                for i in (1..n - 1).rev() {
-                    if i == 1 {
-                        // If we reach index 1 and it's already exhausted (can't be incremented
-                        // without affecting index 0), then all permutations are done.
-                        all_attempted = true;
-                        break;
-                    }
-
-                    if ruler[i] == 1 {
-                        // Keep moving left
-                        continue;
-                    } else {
-                        // Found a segment to decrement.
-                        // Reset this segment to 1, increment its left neighbor,
-                        // and put all remaining weight back into the far right segment.
-                        ruler[i] = 1;
-                        ruler[i - 1] += 1;
-                        let current_sum: u16 = ruler[0..n - 1].iter().map(|&x| x as u16).sum();
-                        ruler[n - 1] = length - (current_sum as u8);
-                        break;
-                    }
-                }
-
-                if all_attempted {
-                    break;
-                }
-            }
-        }
-    }
-}
-
 fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_length: u8) {
     let interrupt = Arc::new(AtomicBool::new(true));
     let r = interrupt.clone();
@@ -316,49 +373,38 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
         }
 
         println!("Solving for length: {}", i);
-        let mut num_segments = get_num_segments_lower_bound(i);
-        let mut solution;
-
-        let length_clock_start = Instant::now();
-        let length_cpu_start = ProcessTime::now();
+        let mut num_segments = state
+            .solutions
+            .get(&i)
+            .map(|s| s.num_segments)
+            .unwrap_or_else(|| get_num_segments_lower_bound(i));
 
         loop {
-            solution = Solution {
-                completed: false,
-                num_segments,
-                rulers: vec![],
-                rulers_found: 0,
-                total_rulers_evaluated: 0,
-                total_clock_time: Duration::ZERO,
-                total_cpu_time: Duration::ZERO,
-            };
+            let status = state.find_rulers(i, num_segments, save_path.as_deref(), &interrupt);
 
-            solution.find_rulers(i, None, &interrupt);
-
-            if !interrupt.load(Ordering::SeqCst) {
-                break;
+            match status {
+                SearchStatus::Finished => {
+                    let solution = state.solutions.get_mut(&i).unwrap();
+                    if !solution.rulers.is_empty() {
+                        solution.completed = true;
+                        state.recalculate_global_metrics();
+                        break;
+                    }
+                    num_segments += 1;
+                    state.solutions.remove(&i);
+                }
+                SearchStatus::Interrupted => {
+                    if let Err(e) = save_state(&state, save_path.as_deref()) {
+                        let destination = save_path.as_deref().unwrap_or("stdout");
+                        eprintln!("Error: Failed to save state to '{}': {}", destination, e);
+                    }
+                    std::process::exit(0);
+                }
             }
-
-            if !solution.rulers.is_empty() {
-                solution.completed = true;
-                solution.rulers_found = solution.rulers.len() as u64;
-                break;
-            }
-
-            num_segments += 1;
         }
-
-        if !interrupt.load(Ordering::SeqCst) {
-            break;
-        }
-
-        solution.total_clock_time = length_clock_start.elapsed();
-        solution.total_cpu_time = length_cpu_start.elapsed();
-
-        state.solutions.insert(i, solution);
-        state.recalculate_global_metrics();
     }
 
+    state.recalculate_global_metrics();
     if let Err(e) = save_state(&state, save_path.as_deref()) {
         let destination = save_path.as_deref().unwrap_or("stdout");
         eprintln!("Error: Failed to save state to '{}': {}", destination, e);
