@@ -199,7 +199,7 @@ impl State {
             // --- Permutation Logic (Moving from right to left) ---
 
             // If the last segment has "weight" to give, move it to the neighbor on the left
-            if ruler[n - 1] > 1 {
+            if n > 2 && ruler[n - 1] > 1 {
                 ruler[n - 1] -= 1;
                 ruler[n - 2] += 1;
             } else {
@@ -228,7 +228,7 @@ impl State {
                     }
                 }
 
-                if all_attempted {
+                if all_attempted || n < 3 {
                     let solution = self.solutions.get_mut(&length).unwrap();
                     solution.checkpoint_ruler = None;
                     solution.total_clock_time += length_clock_start.elapsed();
@@ -441,7 +441,10 @@ fn execute(
             .unwrap_or_else(|| get_num_segments_lower_bound(i));
 
         loop {
-            current_pb.set_message(format!("Length {}, Segments {}: Searching...", i, num_segments));
+            current_pb.set_message(format!(
+                "Length {}, Segments {}: Searching...",
+                i, num_segments
+            ));
             let status = state.find_rulers(
                 i,
                 num_segments,
@@ -471,8 +474,13 @@ fn execute(
                         if !quiet {
                             mp.suspend(|| {
                                 println!(
-                                    "✔ Length {}: Found {} rulers with {} segments in {:?}",
-                                    i, found, segments, time
+                                    "✔ Length {}: Found {} {} with {} {} in {:?}",
+                                    i,
+                                    found,
+                                    if found == 1 { "ruler" } else { "rulers" },
+                                    segments,
+                                    if segments == 1 { "segment" } else { "segments" },
+                                    time
                                 );
                             });
                         }
