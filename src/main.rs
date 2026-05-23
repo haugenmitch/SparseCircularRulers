@@ -1,6 +1,7 @@
 use clap::Parser;
 use cpu_time::ProcessTime;
 use fixedbitset::FixedBitSet;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 use std::collections::HashMap;
@@ -32,6 +33,14 @@ struct Cli {
     /// End ruler length
     #[arg(short = 'z', long, default_value_t = 255)]
     end: u8,
+
+    /// Output JSON to STDOUT at the end
+    #[arg(long)]
+    json: bool,
+
+    /// Do not output to STDOUT
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,6 +106,7 @@ impl State {
         num_segments: u8,
         save_path: Option<&str>,
         interrupt: &AtomicBool,
+        pb: &ProgressBar,
     ) -> SearchStatus {
         let n = num_segments as usize;
 
@@ -145,6 +155,10 @@ impl State {
                 if is_complete(&ruler, length) {
                     solution.rulers.push(ruler.clone());
                     solution.rulers_found = solution.rulers.len() as u64;
+                    pb.set_message(format!(
+                        "Length {}, Segments {}: Found {} (Latest: {:?})",
+                        length, num_segments, solution.rulers_found, ruler
+                    ));
                 }
             }
 
@@ -152,13 +166,29 @@ impl State {
 
             // Periodic Checkpoint - Save while continuing
             if local_evals >= CHECKPOINT_INTERVAL {
-                let solution = self.solutions.get_mut(&length).unwrap();
-                solution.checkpoint_ruler = Some(ruler.clone());
-                solution.total_clock_time += length_clock_start.elapsed();
-                solution.total_cpu_time += length_cpu_start.elapsed();
+                let (rulers_found, last_ruler) = {
+                    let solution = self.solutions.get_mut(&length).unwrap();
+                    solution.checkpoint_ruler = Some(ruler.clone());
+                    solution.total_clock_time += length_clock_start.elapsed();
+                    solution.total_cpu_time += length_cpu_start.elapsed();
+                    (solution.rulers_found, solution.rulers.last().cloned())
+                };
 
                 self.recalculate_global_metrics();
                 let _ = save_state(self, save_path);
+
+                pb.inc(CHECKPOINT_INTERVAL);
+                if let Some(lr) = last_ruler {
+                    pb.set_message(format!(
+                        "Length {}, Segments {}: Found {} (Latest: {:?})",
+                        length, num_segments, rulers_found, lr
+                    ));
+                } else {
+                    pb.set_message(format!(
+                        "Length {}, Segments {}: Searching...",
+                        length, num_segments
+                    ));
+                }
 
                 // Reset chunk timers and local counter
                 length_clock_start = Instant::now();
@@ -306,11 +336,14 @@ fn save_state(state: &State, path: Option<&str>) -> std::io::Result<()> {
         let writer = BufWriter::new(file);
         let mut ser = Serializer::with_formatter(writer, CompactArrayFormatter::new());
         state.serialize(&mut ser).map_err(std::io::Error::other)?;
-    } else {
-        let mut ser = Serializer::with_formatter(io::stdout(), CompactArrayFormatter::new());
-        state.serialize(&mut ser).map_err(std::io::Error::other)?;
-        println!();
     }
+    Ok(())
+}
+
+fn print_state(state: &State) -> std::io::Result<()> {
+    let mut ser = Serializer::with_formatter(io::stdout(), CompactArrayFormatter::new());
+    state.serialize(&mut ser).map_err(std::io::Error::other)?;
+    println!();
     Ok(())
 }
 
@@ -357,22 +390,50 @@ fn is_complete(segments: &[u8], total_length: u8) -> bool {
     measurable_lengths.count_ones(..) == total_length as usize - 1
 }
 
-fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_length: u8) {
+fn execute(
+    mut state: State,
+    save_path: Option<String>,
+    start_length: u8,
+    end_length: u8,
+    output_json: bool,
+    quiet: bool,
+) {
+    let mp = MultiProgress::with_draw_target(if quiet {
+        ProgressDrawTarget::hidden()
+    } else {
+        ProgressDrawTarget::stdout()
+    });
+
+    let overall_pb = mp.add(ProgressBar::new((end_length - start_length + 1) as u64));
+    overall_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    overall_pb.set_message("Overall Progress");
+
+    let current_pb = mp.add(ProgressBar::new_spinner());
+    current_pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg} [{per_sec} evals]")
+            .unwrap(),
+    );
+
     let interrupt = Arc::new(AtomicBool::new(true));
     let r = interrupt.clone();
 
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-        println!("\nReceived interrupt, saving and exiting...");
     })
     .expect("Error setting Ctrl-C handler");
 
     for i in start_length..=end_length {
         if state.solutions.get(&i).is_some_and(|s| s.completed) {
+            overall_pb.inc(1);
             continue;
         }
 
-        println!("Solving for length: {}", i);
         let mut num_segments = state
             .solutions
             .get(&i)
@@ -380,20 +441,52 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
             .unwrap_or_else(|| get_num_segments_lower_bound(i));
 
         loop {
-            let status = state.find_rulers(i, num_segments, save_path.as_deref(), &interrupt);
+            current_pb.set_message(format!("Length {}, Segments {}: Searching...", i, num_segments));
+            let status = state.find_rulers(
+                i,
+                num_segments,
+                save_path.as_deref(),
+                &interrupt,
+                &current_pb,
+            );
 
             match status {
                 SearchStatus::Finished => {
-                    let solution = state.solutions.get_mut(&i).unwrap();
-                    if !solution.rulers.is_empty() {
-                        solution.completed = true;
+                    let (found, segments, time) = {
+                        let solution = state.solutions.get_mut(&i).unwrap();
+                        if !solution.rulers.is_empty() {
+                            solution.completed = true;
+                            (
+                                solution.rulers_found,
+                                solution.num_segments,
+                                solution.total_clock_time,
+                            )
+                        } else {
+                            (0, 0, Duration::ZERO)
+                        }
+                    };
+
+                    if found > 0 {
                         state.recalculate_global_metrics();
+                        if !quiet {
+                            mp.suspend(|| {
+                                println!(
+                                    "✔ Length {}: Found {} rulers with {} segments in {:?}",
+                                    i, found, segments, time
+                                );
+                            });
+                        }
                         break;
                     }
                     num_segments += 1;
                     state.solutions.remove(&i);
                 }
                 SearchStatus::Interrupted => {
+                    current_pb.finish_and_clear();
+                    overall_pb.finish_and_clear();
+                    if !quiet {
+                        println!("\nReceived interrupt, saving and exiting...");
+                    }
                     if let Err(e) = save_state(&state, save_path.as_deref()) {
                         let destination = save_path.as_deref().unwrap_or("stdout");
                         eprintln!("Error: Failed to save state to '{}': {}", destination, e);
@@ -402,13 +495,21 @@ fn execute(mut state: State, save_path: Option<String>, start_length: u8, end_le
                 }
             }
         }
+        overall_pb.inc(1);
     }
+
+    current_pb.finish_and_clear();
+    overall_pb.finish_and_clear();
 
     state.recalculate_global_metrics();
     if let Err(e) = save_state(&state, save_path.as_deref()) {
         let destination = save_path.as_deref().unwrap_or("stdout");
         eprintln!("Error: Failed to save state to '{}': {}", destination, e);
         std::process::exit(1);
+    }
+
+    if output_json && !quiet {
+        let _ = print_state(&state);
     }
 }
 
@@ -472,5 +573,5 @@ fn main() {
         i
     };
 
-    execute(state, save_path, start_length, cli.end);
+    execute(state, save_path, start_length, cli.end, cli.json, cli.quiet);
 }
