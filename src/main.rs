@@ -173,7 +173,17 @@ impl State {
             {
                 let solution = self.solutions.get_mut(&length).unwrap();
                 solution.total_rulers_evaluated += 1;
-                if is_complete(&ruler, length) {
+
+                // Symmetry Breaking: Avoid generating duplicate circular rulers.
+                // We partition the segments (excluding the initial 1) into two halves.
+                // If the sum of the first half (prefix) is greater than the sum of the
+                // second half (suffix), we skip this ruler as its reflection or a
+                // circular shift will be (or has been) evaluated.
+                let m = (n - 1) / 2;
+                let prefix_sum: u16 = ruler[1..=m].iter().map(|&x| x as u16).sum();
+                let suffix_sum: u16 = ruler[n - m..n].iter().map(|&x| x as u16).sum();
+
+                if prefix_sum <= suffix_sum && is_complete(&ruler, length) {
                     solution.rulers.push(ruler.clone());
                     solution.rulers_found = solution.rulers.len() as u64;
 
