@@ -106,7 +106,9 @@ impl State {
         num_segments: u8,
         save_path: Option<&str>,
         interrupt: &AtomicBool,
-        pb: &ProgressBar,
+        status_pb: &ProgressBar,
+        progress_pb: &ProgressBar,
+        stats_pb: &ProgressBar,
     ) -> SearchStatus {
         let n = num_segments as usize;
 
@@ -124,6 +126,8 @@ impl State {
             });
 
             if let Some(r) = solution.checkpoint_ruler.take() {
+                // Synchronize progress count with the checkpoint ruler position
+                solution.total_rulers_evaluated = calculate_rank(length, num_segments, &r) as u64;
                 r
             } else {
                 let mut r = vec![1u8; n];
@@ -131,6 +135,19 @@ impl State {
                 r
             }
         };
+
+        let total_space = calculate_total_space(length, num_segments);
+        progress_pb.set_length(total_space as u64);
+        stats_pb.set_length(total_space as u64);
+        {
+            let solution = self.solutions.get(&length).unwrap();
+            progress_pb.set_position(solution.total_rulers_evaluated);
+            stats_pb.set_position(solution.total_rulers_evaluated);
+            status_pb.set_message(format!(
+                "{}: Found {} rulers with {} segments in {:?}",
+                length, solution.rulers_found, num_segments, solution.total_clock_time
+            ));
+        }
 
         let mut local_evals = 0;
         const CHECKPOINT_INTERVAL: u64 = 1_000_000;
@@ -155,9 +172,11 @@ impl State {
                 if is_complete(&ruler, length) {
                     solution.rulers.push(ruler.clone());
                     solution.rulers_found = solution.rulers.len() as u64;
-                    pb.set_message(format!(
-                        "Length {}, Segments {}: Found {} (Latest: {:?})",
-                        length, num_segments, solution.rulers_found, ruler
+
+                    let elapsed = solution.total_clock_time + length_clock_start.elapsed();
+                    status_pb.set_message(format!(
+                        "{}: Found {} rulers with {} segments in {:?}",
+                        length, solution.rulers_found, num_segments, elapsed
                     ));
                 }
             }
@@ -166,29 +185,27 @@ impl State {
 
             // Periodic Checkpoint - Save while continuing
             if local_evals >= CHECKPOINT_INTERVAL {
-                let (rulers_found, last_ruler) = {
+                let (rulers_found, total_evaluated, elapsed) = {
                     let solution = self.solutions.get_mut(&length).unwrap();
                     solution.checkpoint_ruler = Some(ruler.clone());
                     solution.total_clock_time += length_clock_start.elapsed();
                     solution.total_cpu_time += length_cpu_start.elapsed();
-                    (solution.rulers_found, solution.rulers.last().cloned())
+                    (
+                        solution.rulers_found,
+                        solution.total_rulers_evaluated,
+                        solution.total_clock_time,
+                    )
                 };
 
                 self.recalculate_global_metrics();
                 let _ = save_state(self, save_path);
 
-                pb.inc(CHECKPOINT_INTERVAL);
-                if let Some(lr) = last_ruler {
-                    pb.set_message(format!(
-                        "Length {}, Segments {}: Found {} (Latest: {:?})",
-                        length, num_segments, rulers_found, lr
-                    ));
-                } else {
-                    pb.set_message(format!(
-                        "Length {}, Segments {}: Searching...",
-                        length, num_segments
-                    ));
-                }
+                progress_pb.set_position(total_evaluated);
+                stats_pb.set_position(total_evaluated);
+                status_pb.set_message(format!(
+                    "{}: Found {} rulers with {} segments in {:?}",
+                    length, rulers_found, num_segments, elapsed
+                ));
 
                 // Reset chunk timers and local counter
                 length_clock_start = Instant::now();
@@ -364,6 +381,65 @@ fn get_num_segments_lower_bound(length: u8) -> u8 {
     (((length as f64 * 4.0 - 3.0).sqrt() + 1.0) / 2.0).ceil() as u8
 }
 
+/// Calculate the total number of possible rulers for a given length and number
+/// of segments. This uses the "Stars and Bars". For a ruler of length L with n
+/// segments where the first segment is fixed at 1, we are looking for the
+/// number of compositions of (L-1) into (n-1) parts, where each part s_i >= 1.
+/// The formula is binom((L-1) - 1, (n-1) - 1) = binom(L-2, n-2).
+fn calculate_total_space(length: u8, num_segments: u8) -> f64 {
+    if num_segments < 2 || length < num_segments {
+        return 0.0;
+    }
+    binomial(length as u64 - 2, num_segments as u64 - 2)
+}
+
+/// Calculate the lexicographical rank of a given ruler in the search space.
+///
+/// This implements a ranking algorithm for compositions. The rank is determined by
+/// summing the number of compositions that would appear before the current one
+/// in a lexicographical sort.
+///
+/// For a component s_i at position k, we skip all compositions where the value
+/// at this position is j < s_i. The number of such compositions is:
+/// Sum_{j=1}^{s_i-1} binom((remaining_sum - j) - 1, (remaining_parts - 1) - 1)
+/// Using the Hockey-stick identity, this sum simplifies to:
+/// binom(remaining_sum - 1, remaining_parts - 1) - binom(remaining_sum - s_i, remaining_parts - 1)
+fn calculate_rank(length: u8, num_segments: u8, segments: &[u8]) -> f64 {
+    if num_segments < 2 {
+        return 0.0;
+    }
+    let s = length as u64 - 1;
+    let k = num_segments as u64 - 1;
+    let mut current_s = s;
+    let mut current_k = k;
+    let mut rank = 0.0;
+
+    for &val in &segments[1..num_segments as usize - 1] {
+        let val = val as u64;
+        rank += binomial(current_s - 1, current_k - 1) - binomial(current_s - val, current_k - 1);
+        current_s -= val;
+        current_k -= 1;
+    }
+    rank
+}
+
+/// Calculate binomial coefficient (n choose k) using the multiplicative formula.
+/// res = product_{i=1}^{k} (n - i + 1) / i
+fn binomial(n: u64, k: u64) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    if k == 0 || k == n {
+        return 1.0;
+    }
+    let k = k.min(n - k);
+    let mut res = 1.0;
+    for i in 1..=k {
+        res = res * (n - i + 1) as f64 / i as f64;
+    }
+    res
+}
+
 fn is_complete(segments: &[u8], total_length: u8) -> bool {
     let n = segments.len();
     let mut measurable_lengths = FixedBitSet::with_capacity(total_length as usize);
@@ -404,19 +480,28 @@ fn execute(
         ProgressDrawTarget::stdout()
     });
 
-    let overall_pb = mp.add(ProgressBar::new((end_length - start_length + 1) as u64));
-    overall_pb.set_style(
+    let status_pb = mp.add(ProgressBar::new_spinner());
+    status_pb.enable_steady_tick(Duration::from_millis(100));
+    status_pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} Length {msg}")
+            .unwrap(),
+    );
+
+    let progress_pb = mp.add(ProgressBar::new(0));
+    progress_pb.enable_steady_tick(Duration::from_millis(100));
+    progress_pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
             .unwrap()
             .progress_chars("#>-"),
     );
-    overall_pb.set_message("Overall Progress");
 
-    let current_pb = mp.add(ProgressBar::new_spinner());
-    current_pb.set_style(
+    let stats_pb = mp.add(ProgressBar::new(0));
+    stats_pb.enable_steady_tick(Duration::from_millis(100));
+    stats_pb.set_style(
         ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] {msg} [{per_sec} evals]")
+            .template("  {elapsed_precise} [{per_sec} evals]")
             .unwrap(),
     );
 
@@ -430,7 +515,6 @@ fn execute(
 
     for i in start_length..=end_length {
         if state.solutions.get(&i).is_some_and(|s| s.completed) {
-            overall_pb.inc(1);
             continue;
         }
 
@@ -441,16 +525,14 @@ fn execute(
             .unwrap_or_else(|| get_num_segments_lower_bound(i));
 
         loop {
-            current_pb.set_message(format!(
-                "Length {}, Segments {}: Searching...",
-                i, num_segments
-            ));
             let status = state.find_rulers(
                 i,
                 num_segments,
                 save_path.as_deref(),
                 &interrupt,
-                &current_pb,
+                &status_pb,
+                &progress_pb,
+                &stats_pb,
             );
 
             match status {
@@ -490,8 +572,9 @@ fn execute(
                     state.solutions.remove(&i);
                 }
                 SearchStatus::Interrupted => {
-                    current_pb.finish_and_clear();
-                    overall_pb.finish_and_clear();
+                    status_pb.finish_and_clear();
+                    progress_pb.finish_and_clear();
+                    stats_pb.finish_and_clear();
                     if !quiet {
                         println!("\nReceived interrupt, saving and exiting...");
                     }
@@ -503,11 +586,11 @@ fn execute(
                 }
             }
         }
-        overall_pb.inc(1);
     }
 
-    current_pb.finish_and_clear();
-    overall_pb.finish_and_clear();
+    status_pb.finish_and_clear();
+    progress_pb.finish_and_clear();
+    stats_pb.finish_and_clear();
 
     state.recalculate_global_metrics();
     if let Err(e) = save_state(&state, save_path.as_deref()) {

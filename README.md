@@ -19,6 +19,7 @@ A Rust program to find minimal complete circular sparse rulers.
 
 - [x] Initial Design & Requirements
 - [x] Project Setup
-- [ ] Core Logic Implementation (Validation: [x], Search: [ ])
+- [x] Core Logic Implementation (Validation: [x], Search: [x])
 - [ ] Multi-threading
 - [ ] Optimization
+- [ ] Info readout/summary of results files
