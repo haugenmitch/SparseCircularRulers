@@ -150,7 +150,11 @@ impl State {
         }
 
         let mut local_evals = 0;
-        const CHECKPOINT_INTERVAL: u64 = 1_000_000;
+        const UI_CHECK_INTERVAL: u64 = 100_000;
+        const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+        const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
+        let mut last_ui_update = Instant::now();
+        let mut last_checkpoint = Instant::now();
         let mut length_clock_start = Instant::now();
         let mut length_cpu_start = ProcessTime::now();
 
@@ -183,33 +187,48 @@ impl State {
 
             local_evals += 1;
 
-            // Periodic Checkpoint - Save while continuing
-            if local_evals >= CHECKPOINT_INTERVAL {
-                let (rulers_found, total_evaluated, elapsed) = {
-                    let solution = self.solutions.get_mut(&length).unwrap();
-                    solution.checkpoint_ruler = Some(ruler.clone());
-                    solution.total_clock_time += length_clock_start.elapsed();
-                    solution.total_cpu_time += length_cpu_start.elapsed();
-                    (
-                        solution.rulers_found,
-                        solution.total_rulers_evaluated,
-                        solution.total_clock_time,
-                    )
-                };
+            // Periodic time-based checks
+            if local_evals >= UI_CHECK_INTERVAL {
+                let now = Instant::now();
 
-                self.recalculate_global_metrics();
-                let _ = save_state(self, save_path);
+                // UI Update - Every 0.5 seconds
+                if now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL {
+                    let total_evaluated = self.solutions.get(&length).unwrap().total_rulers_evaluated;
+                    progress_pb.set_position(total_evaluated);
+                    stats_pb.set_position(total_evaluated);
+                    last_ui_update = now;
+                }
 
-                progress_pb.set_position(total_evaluated);
-                stats_pb.set_position(total_evaluated);
-                status_pb.set_message(format!(
-                    "{}: Found {} rulers with {} segments in {:?}",
-                    length, rulers_found, num_segments, elapsed
-                ));
+                // Time-Based Checkpoint - Save every 10 seconds
+                if now.duration_since(last_checkpoint) >= CHECKPOINT_INTERVAL {
+                    let (rulers_found, total_evaluated, elapsed) = {
+                        let solution = self.solutions.get_mut(&length).unwrap();
+                        solution.checkpoint_ruler = Some(ruler.clone());
+                        solution.total_clock_time += length_clock_start.elapsed();
+                        solution.total_cpu_time += length_cpu_start.elapsed();
+                        (
+                            solution.rulers_found,
+                            solution.total_rulers_evaluated,
+                            solution.total_clock_time,
+                        )
+                    };
 
-                // Reset chunk timers and local counter
-                length_clock_start = Instant::now();
-                length_cpu_start = ProcessTime::now();
+                    self.recalculate_global_metrics();
+                    let _ = save_state(self, save_path);
+
+                    progress_pb.set_position(total_evaluated);
+                    stats_pb.set_position(total_evaluated);
+                    status_pb.set_message(format!(
+                        "{}: Found {} rulers with {} segments in {:?}",
+                        length, rulers_found, num_segments, elapsed
+                    ));
+
+                    // Reset checkpoint timer and chunk timers
+                    last_checkpoint = now;
+                    length_clock_start = Instant::now();
+                    length_cpu_start = ProcessTime::now();
+                }
+
                 local_evals = 0;
             }
 
