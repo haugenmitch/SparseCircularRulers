@@ -47,6 +47,7 @@ struct Cli {
 struct Solution {
     #[serde(default)]
     completed: bool,
+    lower_bound_num_segments: u8,
     num_segments: u8,
     rulers: Vec<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,11 +85,11 @@ impl State {
         self.lengths_solved = 0;
 
         for solution in self.solutions.values() {
+            self.total_rulers_evaluated += solution.total_rulers_evaluated;
+            self.total_rulers_found += solution.rulers_found;
+            self.total_clock_time += solution.total_clock_time;
+            self.total_cpu_time += solution.total_cpu_time;
             if solution.completed {
-                self.total_rulers_evaluated += solution.total_rulers_evaluated;
-                self.total_rulers_found += solution.rulers_found;
-                self.total_clock_time += solution.total_clock_time;
-                self.total_cpu_time += solution.total_cpu_time;
                 self.lengths_solved += 1;
             }
         }
@@ -114,8 +115,10 @@ impl State {
 
         // Ensure we have a solution entry and get the starting configuration
         let mut ruler = {
+            let lb = get_num_segments_lower_bound(length);
             let solution = self.solutions.entry(length).or_insert(Solution {
                 completed: false,
+                lower_bound_num_segments: lb,
                 num_segments,
                 rulers: vec![],
                 checkpoint_ruler: None,
@@ -126,8 +129,6 @@ impl State {
             });
 
             if let Some(r) = solution.checkpoint_ruler.take() {
-                // Synchronize progress count with the checkpoint ruler position
-                solution.total_rulers_evaluated = calculate_rank(length, num_segments, &r) as u64;
                 r
             } else {
                 let mut r = vec![1u8; n];
@@ -136,13 +137,15 @@ impl State {
             }
         };
 
+        let mut current_segment_evals = calculate_rank(length, num_segments, &ruler) as u64;
         let total_space = calculate_total_space(length, num_segments);
         progress_pb.set_length(total_space as u64);
         stats_pb.set_length(total_space as u64);
+        progress_pb.set_position(current_segment_evals);
+        stats_pb.set_position(current_segment_evals);
+
         {
             let solution = self.solutions.get(&length).unwrap();
-            progress_pb.set_position(solution.total_rulers_evaluated);
-            stats_pb.set_position(solution.total_rulers_evaluated);
             status_pb.set_message(format!(
                 "{}: Found {} rulers with {} segments in {:?}",
                 length, solution.rulers_found, num_segments, solution.total_clock_time
@@ -173,6 +176,7 @@ impl State {
             {
                 let solution = self.solutions.get_mut(&length).unwrap();
                 solution.total_rulers_evaluated += 1;
+                current_segment_evals += 1;
 
                 // Symmetry Breaking: Avoid generating duplicate circular rulers.
                 // We partition the segments (excluding the initial 1) into two halves.
@@ -203,31 +207,26 @@ impl State {
 
                 // UI Update - Every 0.5 seconds
                 if now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL {
-                    let total_evaluated = self.solutions.get(&length).unwrap().total_rulers_evaluated;
-                    progress_pb.set_position(total_evaluated);
-                    stats_pb.set_position(total_evaluated);
+                    progress_pb.set_position(current_segment_evals);
+                    stats_pb.set_position(current_segment_evals);
                     last_ui_update = now;
                 }
 
                 // Time-Based Checkpoint - Save every 10 seconds
                 if now.duration_since(last_checkpoint) >= CHECKPOINT_INTERVAL {
-                    let (rulers_found, total_evaluated, elapsed) = {
+                    let (rulers_found, elapsed) = {
                         let solution = self.solutions.get_mut(&length).unwrap();
                         solution.checkpoint_ruler = Some(ruler.clone());
                         solution.total_clock_time += length_clock_start.elapsed();
                         solution.total_cpu_time += length_cpu_start.elapsed();
-                        (
-                            solution.rulers_found,
-                            solution.total_rulers_evaluated,
-                            solution.total_clock_time,
-                        )
+                        (solution.rulers_found, solution.total_clock_time)
                     };
 
                     self.recalculate_global_metrics();
                     let _ = save_state(self, save_path);
 
-                    progress_pb.set_position(total_evaluated);
-                    stats_pb.set_position(total_evaluated);
+                    progress_pb.set_position(current_segment_evals);
+                    stats_pb.set_position(current_segment_evals);
                     status_pb.set_message(format!(
                         "{}: Found {} rulers with {} segments in {:?}",
                         length, rulers_found, num_segments, elapsed
@@ -598,7 +597,6 @@ fn execute(
                         break;
                     }
                     num_segments += 1;
-                    state.solutions.remove(&i);
                 }
                 SearchStatus::Interrupted => {
                     status_pb.finish_and_clear();
