@@ -1,6 +1,5 @@
 use clap::Parser;
 use cpu_time::ProcessTime;
-use fixedbitset::FixedBitSet;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
@@ -114,7 +113,7 @@ impl State {
         let n = num_segments as usize;
 
         // Ensure we have a solution entry and get the starting configuration
-        let mut ruler = {
+        let (mut ruler, mut total_evaluated, mut found_rulers, base_clock_time) = {
             let lb = get_num_segments_lower_bound(length);
             let solution = self.solutions.entry(length).or_insert(Solution {
                 completed: false,
@@ -128,27 +127,37 @@ impl State {
                 total_cpu_time: Duration::ZERO,
             });
 
-            if let Some(r) = solution.checkpoint_ruler.take() {
+            let r = if let Some(r) = solution.checkpoint_ruler.take() {
+                // Synchronize progress count with the checkpoint ruler position
+                solution.total_rulers_evaluated = calculate_rank(length, num_segments, &r) as u64;
                 r
             } else {
                 let mut r = vec![1u8; n];
                 r[n - 1] = length - (n as u8 - 1);
                 r
-            }
+            };
+            (
+                r,
+                solution.total_rulers_evaluated,
+                std::mem::take(&mut solution.rulers),
+                solution.total_clock_time,
+            )
         };
 
-        let mut current_segment_evals = calculate_rank(length, num_segments, &ruler) as u64;
         let total_space = calculate_total_space(length, num_segments);
         progress_pb.set_length(total_space as u64);
         stats_pb.set_length(total_space as u64);
-        progress_pb.set_position(current_segment_evals);
-        stats_pb.set_position(current_segment_evals);
+
+        progress_pb.set_position(total_evaluated);
+        stats_pb.set_position(total_evaluated);
 
         {
-            let solution = self.solutions.get(&length).unwrap();
             status_pb.set_message(format!(
                 "{}: Found {} rulers with {} segments in {:?}",
-                length, solution.rulers_found, num_segments, solution.total_clock_time
+                length,
+                found_rulers.len(),
+                num_segments,
+                base_clock_time
             ));
         }
 
@@ -161,41 +170,78 @@ impl State {
         let mut length_clock_start = Instant::now();
         let mut length_cpu_start = ProcessTime::now();
 
+        let m = (n - 1) / 2;
+
+        // Pre-calculate constants for is_complete
+        let l_shift = length as usize;
+        let u64_blocks = l_shift >> 6;
+        let bit_shift = l_shift & 63;
+        let final_mask = if (length as usize) & 63 > 0 {
+            (1u64 << ((length as usize) & 63)) - 1
+        } else {
+            0
+        };
+
         loop {
             // Check for external interrupt (Ctrl-C)
             if !interrupt.load(Ordering::SeqCst) {
                 let solution = self.solutions.get_mut(&length).unwrap();
                 solution.checkpoint_ruler = Some(ruler);
-                solution.total_clock_time += length_clock_start.elapsed();
+                solution.total_rulers_evaluated = total_evaluated;
+                solution.rulers = found_rulers;
+                solution.rulers_found = solution.rulers.len() as u64;
+                solution.total_clock_time = base_clock_time + length_clock_start.elapsed();
                 solution.total_cpu_time += length_cpu_start.elapsed();
                 self.recalculate_global_metrics();
                 return SearchStatus::Interrupted;
             }
 
             // Perform evaluation
-            {
-                let solution = self.solutions.get_mut(&length).unwrap();
-                solution.total_rulers_evaluated += 1;
-                current_segment_evals += 1;
+            // Symmetry Breaking: Lexicographical comparison to break reflection.
+            let is_canonical = if n < 2 || ruler[1] < ruler[n - 1] {
+                true
+            } else if ruler[1] > ruler[n - 1] {
+                false
+            } else {
+                let mut canon = true;
+                for i in 2..=m {
+                    if ruler[i] < ruler[n - i] {
+                        break;
+                    }
+                    if ruler[i] > ruler[n - i] {
+                        canon = false;
+                        break;
+                    }
+                }
+                canon
+            };
 
-                // Symmetry Breaking: Avoid generating duplicate circular rulers.
-                // We partition the segments (excluding the initial 1) into two halves.
-                // If the sum of the first half (prefix) is greater than the sum of the
-                // second half (suffix), we skip this ruler as its reflection or a
-                // circular shift will be (or has been) evaluated.
-                let m = (n - 1) / 2;
-                let prefix_sum: u16 = ruler[1..=m].iter().map(|&x| x as u16).sum();
-                let suffix_sum: u16 = ruler[n - m..n].iter().map(|&x| x as u16).sum();
+            if is_canonical {
+                total_evaluated += 1;
 
-                if prefix_sum <= suffix_sum && is_complete(&ruler, length) {
-                    solution.rulers.push(ruler.clone());
-                    solution.rulers_found = solution.rulers.len() as u64;
+                if is_complete(&ruler, u64_blocks, bit_shift, final_mask) {
+                    found_rulers.push(ruler.clone());
 
-                    let elapsed = solution.total_clock_time + length_clock_start.elapsed();
+                    let elapsed = base_clock_time + length_clock_start.elapsed();
                     status_pb.set_message(format!(
                         "{}: Found {} rulers with {} segments in {:?}",
-                        length, solution.rulers_found, num_segments, elapsed
+                        length,
+                        found_rulers.len(),
+                        num_segments,
+                        elapsed
                     ));
+                }
+            } else {
+                total_evaluated += 1;
+
+                // Optimization: If ruler[1] > ruler[n-1], it will stay greater
+                // as ruler[n-1] decreases and ruler[n-2] increases (if n-2 > 1).
+                if n >= 3 && ruler[1] > ruler[n - 1] && ruler[n - 1] > 1 {
+                    let skip = (ruler[n - 1] - 1) as u64;
+                    total_evaluated += skip;
+                    local_evals += skip;
+                    ruler[n - 2] += ruler[n - 1] - 1;
+                    ruler[n - 1] = 1;
                 }
             }
 
@@ -207,8 +253,8 @@ impl State {
 
                 // UI Update - Every 0.5 seconds
                 if now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL {
-                    progress_pb.set_position(current_segment_evals);
-                    stats_pb.set_position(current_segment_evals);
+                    progress_pb.set_position(total_evaluated);
+                    stats_pb.set_position(total_evaluated);
                     last_ui_update = now;
                 }
 
@@ -217,16 +263,21 @@ impl State {
                     let (rulers_found, elapsed) = {
                         let solution = self.solutions.get_mut(&length).unwrap();
                         solution.checkpoint_ruler = Some(ruler.clone());
+                        solution.total_rulers_evaluated = total_evaluated;
+                        solution.rulers = std::mem::take(&mut found_rulers);
+                        solution.rulers_found = solution.rulers.len() as u64;
                         solution.total_clock_time += length_clock_start.elapsed();
                         solution.total_cpu_time += length_cpu_start.elapsed();
-                        (solution.rulers_found, solution.total_clock_time)
+                        let found = solution.rulers_found;
+                        let time = solution.total_clock_time;
+                        // Put them back
+                        found_rulers = std::mem::take(&mut solution.rulers);
+                        (found, time)
                     };
 
                     self.recalculate_global_metrics();
                     let _ = save_state(self, save_path);
 
-                    progress_pb.set_position(current_segment_evals);
-                    stats_pb.set_position(current_segment_evals);
                     status_pb.set_message(format!(
                         "{}: Found {} rulers with {} segments in {:?}",
                         length, rulers_found, num_segments, elapsed
@@ -276,6 +327,9 @@ impl State {
                 if all_attempted || n < 3 {
                     let solution = self.solutions.get_mut(&length).unwrap();
                     solution.checkpoint_ruler = None;
+                    solution.total_rulers_evaluated = total_evaluated;
+                    solution.rulers = found_rulers;
+                    solution.rulers_found = solution.rulers.len() as u64;
                     solution.total_clock_time += length_clock_start.elapsed();
                     solution.total_cpu_time += length_cpu_start.elapsed();
                     return SearchStatus::Finished;
@@ -468,30 +522,108 @@ fn binomial(n: u64, k: u64) -> f64 {
     res
 }
 
-fn is_complete(segments: &[u8], total_length: u8) -> bool {
+/// Verifies if a ruler is "complete" (can measure all lengths from 1 to L) using bitwise operations.
+///
+/// A ruler is complete if for every distance d in [1, L], there exist marks m1, m2 such that:
+/// (m1 - m2) mod L == d OR (m2 - m1) mod L == d
+///
+/// This implementation uses a bitset (marks) where bit i is set if position i has a mark.
+/// The set of all measurable distances is (M | (M << L)) integrated over all mark positions.
+///
+/// ### Parameters:
+/// * `segments`: The relative lengths between consecutive marks.
+/// * `u64_blocks`: Pre-calculated `L / 64`, used for block-level bitwise shifts and validation.
+/// * `bit_shift`: Pre-calculated `L % 64`, used for bit-level shifts within a block.
+/// * `final_mask`: A bitmask (all 1s for the first `L % 64` bits) to check the final partial block.
+fn is_complete(segments: &[u8], u64_blocks: usize, bit_shift: usize, final_mask: u64) -> bool {
     let n = segments.len();
-    let mut measurable_lengths = FixedBitSet::with_capacity(total_length as usize);
-    let mut sums = vec![0u16; n];
+    let mut marks = [0u64; 4]; // Supports up to length 256
+    let mut current_pos = 0;
 
-    // Iteratively calculate sums of k segments (from k=1 to n-1)
-    for k in 1..n {
-        for i in 0..n {
-            // Update the sum at index i to include the next successive segment
-            sums[i] += segments[(i + k - 1) % n] as u16;
-
-            measurable_lengths.insert(sums[i] as usize);
+    // Step 1: Populate the bitset with mark positions
+    marks[0] |= 1; // First mark is always at 0
+    for &s in &segments[..n - 1] {
+        current_pos += s as usize;
+        if current_pos < 256 {
+            // Divide current_pos by 64 to index into the proper u64 in the
+            // array, then set the bit at the proper position in that u64.
+            marks[current_pos >> 6] |= 1 << (current_pos & 63);
         }
+    }
 
-        // Early Exit Optimization:
-        // Since all segments are >= 1, any contiguous sum of k segments must be
-        // at least k. If we haven't found length 'k' by now, we never will.
-        if !measurable_lengths.contains(k) {
+    // Step 2: Create a virtual bitset m2 representing (M | (M << L))
+    // This virtual bitset is crucial for handling circular/modular wrap-around.
+    // By duplicating the marks at position L (via shifting), any modular distance
+    // (m1 - m2) mod L can be found by a simple linear shift in the next step.
+    // m2 is double the size of marks (8 * 64 bits) to accommodate the shift.
+    let mut m2 = [0u64; 8];
+    for i in 0..4 {
+        // Copy original marks
+        m2[i] |= marks[i];
+
+        // Shift and OR the marks into the higher blocks of m2 to represent (M << L)
+        if bit_shift == 0 {
+            // Optimization: L is a perfect multiple of 64
+            if i + u64_blocks < 8 {
+                m2[i + u64_blocks] |= marks[i];
+            }
+        } else {
+            // General case: L shift spans across block boundaries
+            if i + u64_blocks < 8 {
+                m2[i + u64_blocks] |= marks[i] << bit_shift;
+            }
+            if i + u64_blocks + 1 < 8 {
+                m2[i + u64_blocks + 1] |= marks[i] >> (64 - bit_shift);
+            }
+        }
+    }
+
+    // Step 3: Calculate measurable distances (differences between marks)
+    // We compute the union of the bitset shifted by every mark position.
+    // Mathematically, if bit 'd' is set in the result, it means there exists
+    // a pair of marks (m1, m2) such that (m1 - m2) mod L == d.
+    // By shifting the virtual bitset m2 (which contains duplicated marks at +L),
+    // we correctly capture wrap-around distances in a single linear pass.
+    let mut diffs = [0u64; 4];
+    current_pos = 0;
+
+    // Shift for mark at position 0 (Identity shift)
+    for j in 0..4 {
+        diffs[j] |= m2[j];
+    }
+
+    // Shift for all other mark positions
+    for &s in &segments[..n - 1] {
+        current_pos += s as usize;
+        let u_shift = current_pos >> 6; // Number of full 64-bit blocks to shift
+        let b_shift = current_pos & 63; // Number of bits to shift within a block
+
+        if b_shift == 0 {
+            // Optimization: Aligning on a 64-bit boundary allows a direct OR
+            for j in 0..4 {
+                diffs[j] |= m2[j + u_shift];
+            }
+        } else {
+            // General case: The shift spans across two adjacent u64 blocks in m2.
+            // We extract the relevant bits from the 'current' and 'next' blocks.
+            for j in 0..4 {
+                diffs[j] |= (m2[j + u_shift] >> b_shift) | (m2[j + u_shift + 1] << (64 - b_shift));
+            }
+        }
+    }
+
+    // Step 4: Verify that all bits from 1 to L-1 are set
+    // A ruler is complete if every bit corresponding to a distance [1, L-1] is 1.
+    // We first check all full 64-bit blocks for speed (must be all 1s).
+    for i in 0..u64_blocks {
+        if diffs[i] != !0 {
             return false;
         }
     }
 
-    // Final check to ensure every length from 1 to total_length-1 is measurable.
-    measurable_lengths.count_ones(..) == total_length as usize - 1
+    // Finally, check the last partial block if L is not a multiple of 64.
+    // The final_mask ensures we only look at bits up to L-1 and ignore padding.
+    !(final_mask > 0 && (diffs[u64_blocks] & final_mask) != final_mask)
 }
 
 fn execute(
