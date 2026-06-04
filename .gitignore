@@ -1,7 +1,10 @@
 /target
 
+venv/
+.venv/
 .vscode/
-
+GEMINI.md
 
 examples/
+tools/
 *.json

@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod gpu;
+use gpu::{GpuContext, SearchParams};
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -45,6 +48,10 @@ struct Cli {
     /// Do not output to STDOUT
     #[arg(short, long)]
     quiet: bool,
+
+    /// Use GPU acceleration (wgpu)
+    #[arg(short, long)]
+    gpu: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,12 +87,21 @@ struct SearchContext<'a> {
     save_path: Option<&'a str>,
     interrupt: &'a AtomicBool,
     progress: &'a SearchProgress,
+    gpu: Option<&'a GpuContext>,
 }
 
 struct SearchTiming<'a> {
     base_clock_time: Duration,
     clock_start: &'a Instant,
     cpu_start: &'a ProcessTime,
+}
+
+struct RangeContext<'a> {
+    length: u8,
+    num_segments: u8,
+    interrupt: &'a AtomicBool,
+    eval_counter: &'a AtomicU64,
+    found_counter: &'a AtomicU64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -204,44 +220,50 @@ impl State {
             }
         });
 
+        let range_ctx = RangeContext {
+            length: ctx.length,
+            num_segments: ctx.num_segments,
+            interrupt: ctx.interrupt,
+            eval_counter: &eval_counter,
+            found_counter: &found_counter,
+        };
+
         while current_rank < total_space {
             if !ctx.interrupt.load(Ordering::SeqCst) {
                 status = SearchStatus::Interrupted;
                 break;
             }
 
-            let num_threads = rayon::current_num_threads() as u64;
-            let batch_size = num_threads * 4;
-            let batch_end = (current_rank + batch_size * CHUNK_SIZE).min(total_space);
-            let chunk_starts: Vec<u64> = (current_rank..batch_end)
-                .step_by(CHUNK_SIZE as usize)
-                .collect();
+            let (new_current_rank, all_completed) = if let Some(gpu) = ctx.gpu {
+                let chunk_end = (current_rank + CHUNK_SIZE).min(total_space);
+                let (mut chunk_found, _chunk_evals, completed) =
+                    gpu_search_range(&range_ctx, gpu, current_rank, chunk_end);
+                found_rulers.append(&mut chunk_found);
+                (chunk_end, completed)
+            } else {
+                let num_threads = rayon::current_num_threads() as u64;
+                let batch_size = num_threads * 4;
+                let batch_end = (current_rank + batch_size * CHUNK_SIZE).min(total_space);
+                let chunk_starts: Vec<u64> = (current_rank..batch_end)
+                    .step_by(CHUNK_SIZE as usize)
+                    .collect();
 
-            // Parallel Search
-            let results: Vec<(Vec<Vec<u8>>, u64, bool)> = chunk_starts
-                .into_par_iter()
-                .map(|chunk_start| {
-                    let chunk_end = (chunk_start + CHUNK_SIZE).min(total_space);
-                    search_range(
-                        ctx.length,
-                        ctx.num_segments,
-                        chunk_start,
-                        chunk_end,
-                        ctx.interrupt,
-                        &eval_counter,
-                        &found_counter,
-                    )
-                })
-                .collect();
+                let results: Vec<(Vec<Vec<u8>>, u64, bool)> = chunk_starts
+                    .into_par_iter()
+                    .map(|chunk_start| {
+                        let chunk_end = (chunk_start + CHUNK_SIZE).min(total_space);
+                        search_range(&range_ctx, chunk_start, chunk_end)
+                    })
+                    .collect();
 
-            // Low-Water Mark Checkpointing
-            let (new_current_rank, all_completed) = self.process_search_results(
-                &mut found_rulers,
-                results,
-                current_rank,
-                batch_end,
-                CHUNK_SIZE,
-            );
+                self.process_search_results(
+                    &mut found_rulers,
+                    results,
+                    current_rank,
+                    batch_end,
+                    CHUNK_SIZE,
+                )
+            };
 
             current_rank = new_current_rank;
 
@@ -410,33 +432,95 @@ impl State {
     }
 }
 
+fn gpu_search_range(
+    ctx: &RangeContext,
+    gpu: &GpuContext,
+    start_rank: u64,
+    end_rank: u64,
+) -> (Vec<Vec<u8>>, u64, bool) {
+    let mut current_rank = start_rank;
+    let mut found_rulers = Vec::new();
+
+    const STEPS_PER_THREAD: u32 = 1024;
+    const THREADS_PER_BATCH: u32 = 65536;
+    let total_steps_per_batch = (STEPS_PER_THREAD as u64) * (THREADS_PER_BATCH as u64);
+
+    let mut in_flight = std::collections::VecDeque::new();
+    const MAX_IN_FLIGHT: usize = 2;
+
+    while current_rank < end_rank || !in_flight.is_empty() {
+        while current_rank < end_rank && in_flight.len() < MAX_IN_FLIGHT {
+            if !ctx.interrupt.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let remaining = end_rank - current_rank;
+            let this_batch_threads = if remaining >= total_steps_per_batch {
+                THREADS_PER_BATCH
+            } else {
+                remaining.div_ceil(STEPS_PER_THREAD as u64) as u32
+            };
+
+            let params = SearchParams {
+                length: ctx.length as u32,
+                num_segments: ctx.num_segments as u32,
+                batch_size: this_batch_threads,
+                start_rank_low: (current_rank & 0xFFFFFFFF) as u32,
+                start_rank_high: (current_rank >> 32) as u32,
+                steps_per_thread: STEPS_PER_THREAD,
+                _padding: [0; 2],
+            };
+
+            let task = gpu.submit_search(&params);
+            let processed = (this_batch_threads as u64) * (STEPS_PER_THREAD as u64);
+            in_flight.push_back((task, processed.min(remaining)));
+            current_rank += processed.min(remaining);
+        }
+
+        if let Some((task, batch_processed)) = in_flight.pop_front() {
+            let found_ranks = gpu.wait_for_search(task);
+            for rank in found_ranks {
+                found_rulers.push(unrank(ctx.length, ctx.num_segments, rank as f64));
+                ctx.found_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            ctx.eval_counter
+                .fetch_add(batch_processed, Ordering::Relaxed);
+        }
+
+        if !ctx.interrupt.load(Ordering::SeqCst) && current_rank < end_rank {
+            break;
+        }
+    }
+
+    found_rulers.sort();
+    found_rulers.dedup();
+
+    (
+        found_rulers,
+        current_rank - start_rank,
+        current_rank >= end_rank,
+    )
+}
+
 /// Searches a specific range of ruler ranks for complete sparse rulers.
 ///
 /// Returns a tuple containing:
 /// 1. The list of found rulers.
 /// 2. The number of evaluations performed.
 /// 3. A boolean indicating if the range was fully searched (true) or interrupted (false).
-fn search_range(
-    length: u8,
-    num_segments: u8,
-    start_rank: u64,
-    end_rank: u64,
-    interrupt: &AtomicBool,
-    eval_counter: &AtomicU64,
-    found_counter: &AtomicU64,
-) -> (Vec<Vec<u8>>, u64, bool) {
-    let n = num_segments as usize;
-    let mut ruler = unrank(length, num_segments, start_rank as f64);
+fn search_range(ctx: &RangeContext, start_rank: u64, end_rank: u64) -> (Vec<Vec<u8>>, u64, bool) {
+    let n = ctx.num_segments as usize;
+    let mut ruler = unrank(ctx.length, ctx.num_segments, start_rank as f64);
     let mut current_rank = start_rank;
     let mut found_rulers = Vec::new();
     let m = (n - 1) / 2;
 
     // Pre-calculate constants for is_complete
-    let l_shift = length as usize;
+    let l_shift = ctx.length as usize;
     let u64_blocks = l_shift >> 6;
     let bit_shift = l_shift & 63;
-    let final_mask = if (length as usize) & 63 > 0 {
-        (1u64 << ((length as usize) & 63)) - 1
+    let final_mask = if (ctx.length as usize) & 63 > 0 {
+        (1u64 << ((ctx.length as usize) & 63)) - 1
     } else {
         0
     };
@@ -448,8 +532,11 @@ fn search_range(
 
     while current_rank < end_rank {
         // Efficiency: Periodic interrupt check to minimize atomic overhead
-        if local_evals & (INTERRUPT_CHECK_INTERVAL - 1) == 0 && !interrupt.load(Ordering::Relaxed) {
-            eval_counter.fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
+        if local_evals & (INTERRUPT_CHECK_INTERVAL - 1) == 0
+            && !ctx.interrupt.load(Ordering::Relaxed)
+        {
+            ctx.eval_counter
+                .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
             return (found_rulers, current_rank - start_rank, false);
         }
 
@@ -475,14 +562,14 @@ fn search_range(
         if is_canonical {
             if is_complete(&ruler, u64_blocks, bit_shift, final_mask) {
                 found_rulers.push(ruler.clone());
-                found_counter.fetch_add(1, Ordering::Relaxed);
+                ctx.found_counter.fetch_add(1, Ordering::Relaxed);
             }
             current_rank += 1;
         } else {
             current_rank += 1;
 
-            // Optimization: If ruler[1] > ruler[n-1], it will stay greater
-            // as ruler[n-1] decreases and ruler[n-2] increases.
+            // Symmetry-Breaking Skip: If ruler[1] > ruler[n-1], we can skip the remaining
+            // combinations for the current s_1, s_2, ..., s_{n-2} values.
             if n >= 3 && ruler[1] > ruler[n - 1] && ruler[n - 1] > 1 {
                 let skip = (ruler[n - 1] - 1) as u64;
                 let next_rank = current_rank + skip;
@@ -496,7 +583,8 @@ fn search_range(
                     // Cannot skip beyond the assigned range; cap at end_rank
                     let actual_skip = end_rank - current_rank;
                     local_evals += actual_skip;
-                    eval_counter.fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
+                    ctx.eval_counter
+                        .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
                     return (found_rulers, end_rank - start_rank, true);
                 }
             }
@@ -504,7 +592,8 @@ fn search_range(
 
         local_evals += 1;
         if local_evals - last_eval_update >= COUNTER_UPDATE_INTERVAL {
-            eval_counter.fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
+            ctx.eval_counter
+                .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
             last_eval_update = local_evals;
         }
 
@@ -529,7 +618,7 @@ fn search_range(
                     ruler[i] = 1;
                     ruler[i - 1] += 1;
                     let current_sum: u16 = ruler[0..n - 1].iter().map(|&x| x as u16).sum();
-                    ruler[n - 1] = length - (current_sum as u8);
+                    ruler[n - 1] = ctx.length - (current_sum as u8);
                     break;
                 }
             }
@@ -539,7 +628,8 @@ fn search_range(
         }
     }
 
-    eval_counter.fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
+    ctx.eval_counter
+        .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
     (found_rulers, current_rank - start_rank, true)
 }
 
@@ -871,6 +961,7 @@ fn execute(
     end_length: u8,
     output_json: bool,
     quiet: bool,
+    gpu: Option<&GpuContext>,
 ) {
     let mp = MultiProgress::with_draw_target(if quiet {
         ProgressDrawTarget::hidden()
@@ -935,6 +1026,7 @@ fn execute(
                 save_path: save_path.as_deref(),
                 interrupt: &interrupt,
                 progress: &progress,
+                gpu,
             };
 
             let status = state.find_rulers(&ctx);
@@ -1001,7 +1093,7 @@ fn execute(
         std::process::exit(1);
     }
 
-    if output_json && !quiet {
+    if output_json {
         let _ = print_state(&state);
     }
 }
@@ -1061,6 +1153,19 @@ fn main() {
 
     state.recalculate_global_metrics();
 
+    let gpu_ctx = if cli.gpu {
+        let ctx = pollster::block_on(GpuContext::new(65536));
+        if ctx.is_none() {
+            eprintln!(
+                "Error: Failed to initialize GPU. Ensure you have a compatible graphics card and drivers installed."
+            );
+            std::process::exit(1);
+        }
+        ctx
+    } else {
+        None
+    };
+
     let start_length = if cli.start >= 1 {
         cli.start
     } else {
@@ -1072,5 +1177,13 @@ fn main() {
         i
     };
 
-    execute(state, save_path, start_length, cli.end, cli.json, cli.quiet);
+    execute(
+        state,
+        save_path,
+        start_length,
+        cli.end,
+        cli.json,
+        cli.quiet,
+        gpu_ctx.as_ref(),
+    );
 }
