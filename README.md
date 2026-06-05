@@ -6,7 +6,7 @@ A Rust program to find minimal complete circular sparse rulers.
 
 - **Circular Sparse Ruler**: A set of $k$ segments $s_1, s_2, \dots, s_k$ that sum to a total length $L$.
 - **Complete**: A ruler is complete if every distance $d \in \{1, 2, \dots, L-1\}$ can be formed by summing a contiguous sequence of segments (cyclically).
-- **Minimal**: For a given length $L$, the ruler has the minimum possible number of segments $k$ to be complete.
+- **Minimal**: For a given length $L$, the ruler has the minimum possible number of segments $k$ to be complete and the ruler is no longer than $L$.
 
 ## Requirements & Design
 

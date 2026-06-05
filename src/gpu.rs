@@ -1,8 +1,8 @@
 use bytemuck::{Pod, Zeroable};
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::Mutex;
+use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -184,7 +184,9 @@ impl GpuContext {
         let counter_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Counter Buffer"),
             size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -242,12 +244,16 @@ impl GpuContext {
     pub fn submit_search(&self, params: &SearchParams) -> GpuSearchTask {
         let bufs = self.get_buffers();
 
-        self.queue.write_buffer(&bufs.params_buffer, 0, bytemuck::cast_slice(&[*params]));
-        self.queue.write_buffer(&bufs.counter_buffer, 0, bytemuck::cast_slice(&[0u32]));
+        self.queue
+            .write_buffer(&bufs.params_buffer, 0, bytemuck::cast_slice(&[*params]));
+        self.queue
+            .write_buffer(&bufs.counter_buffer, 0, bytemuck::cast_slice(&[0u32]));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Compute Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -266,7 +272,13 @@ impl GpuContext {
             }
         }
 
-        encoder.copy_buffer_to_buffer(&bufs.results_buffer, 0, &bufs.staging_results, 0, (self.max_results as u64) * 8);
+        encoder.copy_buffer_to_buffer(
+            &bufs.results_buffer,
+            0,
+            &bufs.staging_results,
+            0,
+            (self.max_results as u64) * 8,
+        );
         encoder.copy_buffer_to_buffer(&bufs.counter_buffer, 0, &bufs.staging_counter, 0, 4);
 
         self.queue.submit(Some(encoder.finish()));
@@ -290,25 +302,31 @@ impl GpuContext {
     pub fn wait_for_search(&self, task: GpuSearchTask) -> Vec<u64> {
         self.device.poll(wgpu::Maintain::Wait);
 
-        let results = if let (Ok(Ok(())), Ok(Ok(()))) = (task.c_receiver.recv(), task.r_receiver.recv()) {
-            let counter_slice = task.bufs.staging_counter.slice(..);
-            let counter_data = counter_slice.get_mapped_range();
-            let count = bytemuck::cast_slice::<u8, u32>(&counter_data)[0] as usize;
-            drop(counter_data);
-            task.bufs.staging_counter.unmap();
+        let results =
+            if let (Ok(Ok(())), Ok(Ok(()))) = (task.c_receiver.recv(), task.r_receiver.recv()) {
+                let counter_slice = task.bufs.staging_counter.slice(..);
+                let counter_data = counter_slice.get_mapped_range();
+                let count = bytemuck::cast_slice::<u8, u32>(&counter_data)[0] as usize;
+                drop(counter_data);
+                task.bufs.staging_counter.unmap();
 
-            let results_slice = task.bufs.staging_results.slice(0..(self.max_results as u64 * 8));
-            let results_data = results_slice.get_mapped_range();
-            let mut ranks = bytemuck::cast_slice::<u8, u64>(&results_data)[..count.min(self.max_results as usize)].to_vec();
-            drop(results_data);
-            task.bufs.staging_results.unmap();
-            
-            ranks.sort_unstable();
-            ranks.dedup();
-            ranks
-        } else {
-            Vec::new()
-        };
+                let results_slice = task
+                    .bufs
+                    .staging_results
+                    .slice(0..(self.max_results as u64 * 8));
+                let results_data = results_slice.get_mapped_range();
+                let mut ranks = bytemuck::cast_slice::<u8, u64>(&results_data)
+                    [..count.min(self.max_results as usize)]
+                    .to_vec();
+                drop(results_data);
+                task.bufs.staging_results.unmap();
+
+                ranks.sort_unstable();
+                ranks.dedup();
+                ranks
+            } else {
+                Vec::new()
+            };
 
         self.return_buffers(task.bufs);
         results
@@ -316,8 +334,12 @@ impl GpuContext {
 }
 
 fn binomial_u64(n: u64, k: u64) -> u64 {
-    if k > n { return 0; }
-    if k == 0 || k == n { return 1; }
+    if k > n {
+        return 0;
+    }
+    if k == 0 || k == n {
+        return 1;
+    }
     let k = k.min(n - k);
     let mut res = 1.0f64;
     for i in 1..=k {

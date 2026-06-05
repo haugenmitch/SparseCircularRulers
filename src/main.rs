@@ -161,7 +161,8 @@ impl State {
             return SearchStatus::Finished;
         }
 
-        let (start_rank, mut found_rulers, base_clock_time) = self.initialize_solution(ctx);
+        let (start_rank, mut found_rulers, base_clock_time, base_cpu_time) =
+            self.initialize_solution(ctx);
         let start_found_count = found_rulers.len() as u64;
 
         let total_space = calculate_total_space(ctx.length, ctx.num_segments) as u64;
