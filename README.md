@@ -23,10 +23,10 @@ A Rust program to find minimal complete circular sparse rulers.
 - [x] Multi-threading
 - [ ] Optimization
 - [ ] Refactor program to allow genericizing of integer sequence calculations
-- [ ] Unit tests
+- [x] Unit tests
 - [ ] Info readout/summary of results files
 - [x] CUDA/threading using the GPU
-- [ ] Re-add latest ruler found display to UI
-- [ ] Make sure the program is robust up to length 256 (e.g. `rank` is a u64, is that large enough for long rulers?)
-- [ ] "/s evals" -> "evals/s"
-
+- [x] Re-add latest ruler found display to UI
+- [ ] Make sure the program is robust up to length 256 (e.g. `rank` is a u64, is that large enough for long rulers? - Currently f64/u64, might need bigints for L > 120)
+- [x] "/s evals" -> "evals/s"
+- [x] Robust symmetry breaking (Circular/Reflection) to ensure unique rulers in output.

@@ -512,12 +512,14 @@ fn gpu_search_range(
             let found_ranks = gpu.wait_for_search(task);
             for rank in found_ranks {
                 let r = unrank(ctx.length, ctx.num_segments, rank as f64);
-                {
-                    let mut latest = ctx.latest_ruler.lock().unwrap();
-                    *latest = Some(r.clone());
+                if is_canonical(&r) {
+                    {
+                        let mut latest = ctx.latest_ruler.lock().unwrap();
+                        *latest = Some(r.clone());
+                    }
+                    found_rulers.push(r);
+                    ctx.found_counter.fetch_add(1, Ordering::Relaxed);
                 }
-                found_rulers.push(r);
-                ctx.found_counter.fetch_add(1, Ordering::Relaxed);
             }
             ctx.eval_counter
                 .fetch_add(batch_processed, Ordering::Relaxed);
@@ -545,7 +547,6 @@ fn search_range(ctx: &RangeContext, start_rank: u64, end_rank: u64) -> (Vec<Vec<
     let mut ruler = unrank(ctx.length, ctx.num_segments, start_rank as f64);
     let mut current_rank = start_rank;
     let mut found_rulers = Vec::new();
-    let m = (n - 1) / 2;
 
     // Pre-calculate constants for is_complete
     let l_shift = ctx.length as usize;
@@ -572,26 +573,8 @@ fn search_range(ctx: &RangeContext, start_rank: u64, end_rank: u64) -> (Vec<Vec<
             return (found_rulers, false);
         }
 
-        // Symmetry Breaking: Lexicographical comparison to break reflection.
-        let is_canonical = if n < 2 || ruler[1] < ruler[n - 1] {
-            true
-        } else if ruler[1] > ruler[n - 1] {
-            false
-        } else {
-            let mut canon = true;
-            for i in 2..=m {
-                if ruler[i] < ruler[n - i] {
-                    break;
-                }
-                if ruler[i] > ruler[n - i] {
-                    canon = false;
-                    break;
-                }
-            }
-            canon
-        };
-
-        if is_canonical {
+        // Symmetry Breaking: Full lexicographical comparison to break all rotation and reflection symmetries.
+        if is_canonical(&ruler) {
             if is_complete(&ruler, u64_blocks, bit_shift, final_mask) {
                 found_rulers.push(ruler.clone());
                 ctx.found_counter.fetch_add(1, Ordering::Relaxed);
@@ -884,6 +867,62 @@ fn binomial(n: u64, k: u64) -> f64 {
         res = res * (n - i + 1) as f64 / i as f64;
     }
     res
+}
+
+/// Checks if a ruler is "canonical" (the lexicographical minimum among all its rotations and reflections).
+///
+/// A circular ruler can be represented by many different segment sequences depending on
+/// which segment you start with and which direction you go (rotation and reflection).
+/// To avoid duplicate solutions, we only accept the lexicographical minimum of all
+/// 2N possible representations (N rotations and N reflections).
+///
+/// Since our search only explores compositions where s_0 = 1, and 1 is the minimum
+/// possible segment value, we only need to compare the current ruler with other
+/// rotations and reflections that also start with 1.
+fn is_canonical(ruler: &[u8]) -> bool {
+    let n = ruler.len();
+    if n < 2 {
+        return true;
+    }
+
+    // 1. Check other rotations starting with 1.
+    // If any rotation is lexicographically smaller than the current ruler,
+    // then the current ruler is not canonical.
+    for i in 1..n {
+        if ruler[i] == 1 {
+            for j in 0..n {
+                let a = ruler[j];
+                let b = ruler[(i + j) % n];
+                if b < a {
+                    return false;
+                }
+                if b > a {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Check all reflections starting with 1.
+    // A reflection starting at index i (going backwards) is compared with the ruler.
+    // This handles both the standard reflection (fixing s_0) and reflections
+    // starting from other '1' segments.
+    for i in 0..n {
+        if ruler[i] == 1 {
+            for j in 0..n {
+                let a = ruler[j];
+                let b = ruler[(i + n - j) % n];
+                if b < a {
+                    return false;
+                }
+                if b > a {
+                    break;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 /// Verifies if a ruler is "complete" (can measure all lengths from 1 to L) using bitwise operations.
@@ -1257,6 +1296,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_canonical() {
+        // [1, 1, 3, 6] is canonical
+        assert!(is_canonical(&[1, 1, 3, 6]));
+        // [1, 1, 6, 3] is a reflection, NOT canonical (it should be [1, 1, 3, 6])
+        assert!(!is_canonical(&[1, 1, 6, 3]));
+        // [1, 3, 6, 1] is a rotation, NOT canonical
+        assert!(!is_canonical(&[1, 3, 6, 1]));
+
+        // Symmetric rulers should be canonical if they are the lexicographical minimum
+        assert!(is_canonical(&[1, 1, 2, 2])); // n=4, L=6
+        assert!(!is_canonical(&[1, 2, 2, 1])); // [1, 1, 2, 2] is smaller
+        assert!(is_canonical(&[1, 2, 1, 2])); // n=4, L=6
+
+        // Test with multiple 1s
+        assert!(is_canonical(&[1, 1, 2, 1, 1, 3]));
+        assert!(!is_canonical(&[1, 1, 3, 1, 1, 2])); // Reflection is smaller
+    }
 
     #[test]
     fn test_binomial() {
