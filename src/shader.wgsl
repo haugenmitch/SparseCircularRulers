@@ -83,22 +83,25 @@ fn is_complete(ruler: ptr<function, array<u32, 32>>, length: u32, n: u32) -> boo
         if (cp < 256u) { marks[cp >> 5] |= (1u << (cp & 31u)); }
     }
 
-    let u32_blocks = length >> 5;
+    let u32_blocks = (length + 31u) >> 5;
     let bit_shift = length & 31u;
     
     var m2 = array<u32, 16>(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
-    for (var i: u32 = 0; i < 8; i++) {
+    let num_mark_blocks = (length + 31u) >> 5;
+    for (var i: u32 = 0; i < num_mark_blocks; i++) {
         m2[i] |= marks[i];
-        if (bit_shift == 0) {
-            if (i + u32_blocks < 16u) { m2[i + u32_blocks] |= marks[i]; }
+        let shift_blocks = length >> 5;
+        let shift_bits = length & 31u;
+        if (shift_bits == 0) {
+            if (i + shift_blocks < 16u) { m2[i + shift_blocks] |= marks[i]; }
         } else {
-            if (i + u32_blocks < 16u) { m2[i + u32_blocks] |= marks[i] << bit_shift; }
-            if (i + u32_blocks + 1u < 16u) { m2[i + u32_blocks + 1u] |= marks[i] >> (32u - bit_shift); }
+            if (i + shift_blocks < 16u) { m2[i + shift_blocks] |= marks[i] << shift_bits; }
+            if (i + shift_blocks + 1u < 16u) { m2[i + shift_blocks + 1u] |= marks[i] >> (32u - shift_bits); }
         }
     }
 
     var diffs = array<u32, 8>(0,0,0,0,0,0,0,0);
-    for (var j: u32 = 0; j < 8; j++) { diffs[j] |= m2[j]; }
+    for (var j: u32 = 0; j < num_mark_blocks; j++) { diffs[j] |= m2[j]; }
 
     cp = 0;
     for (var i: u32 = 1; i < n; i++) {
@@ -106,9 +109,9 @@ fn is_complete(ruler: ptr<function, array<u32, 32>>, length: u32, n: u32) -> boo
         let us = cp >> 5;
         let bs = cp & 31u;
         if (bs == 0u) {
-            for (var j: u32 = 0; j < 8; j++) { if (j + us < 16u) { diffs[j] |= m2[j + us]; } }
+            for (var j: u32 = 0; j < num_mark_blocks; j++) { if (j + us < 16u) { diffs[j] |= m2[j + us]; } }
         } else {
-            for (var j: u32 = 0; j < 8; j++) {
+            for (var j: u32 = 0; j < num_mark_blocks; j++) {
                 let low = m2[j + us];
                 var high = 0u;
                 if (j + us + 1u < 16u) { high = m2[j + us + 1u]; }
@@ -117,12 +120,13 @@ fn is_complete(ruler: ptr<function, array<u32, 32>>, length: u32, n: u32) -> boo
         }
     }
 
-    for (var i: u32 = 0; i < u32_blocks; i++) {
+    let full_blocks = length >> 5;
+    for (var i: u32 = 0; i < full_blocks; i++) {
         if (diffs[i] != 0xFFFFFFFFu) { return false; }
     }
     if (bit_shift > 0u) {
         let mask = (1u << bit_shift) - 1u;
-        if ((diffs[u32_blocks] & mask) != mask) { return false; }
+        if ((diffs[full_blocks] & mask) != mask) { return false; }
     }
     return true;
 }

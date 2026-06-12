@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod gpu;
-use gpu::{GpuContext, SearchParams};
+use gpu::{GpuConfig, GpuContext, SearchParams};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -198,6 +198,15 @@ impl State {
         let mut current_rank = start_rank;
         let mut status = SearchStatus::Finished;
 
+        let config = GpuConfig::for_length(ctx.length as u32);
+        let steps_per_thread: u32 = std::env::var("GPU_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(config.steps_per_thread);
+        let threads_per_batch: u32 = std::env::var("GPU_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(config.threads_per_batch);
         let timing = SearchTiming {
             base_clock_time,
             base_cpu_time,
@@ -264,7 +273,7 @@ impl State {
             let (new_current_rank, all_completed) = if let Some(gpu) = ctx.gpu {
                 let chunk_end = (current_rank + CHUNK_SIZE).min(total_space);
                 let (mut chunk_found, completed) =
-                    gpu_search_range(&range_ctx, gpu, current_rank, chunk_end);
+                    gpu_search_range(&range_ctx, gpu, current_rank, chunk_end, steps_per_thread, threads_per_batch);
                 found_rulers.append(&mut chunk_found);
                 (chunk_end, completed)
             } else {
@@ -468,13 +477,13 @@ fn gpu_search_range(
     gpu: &GpuContext,
     start_rank: u64,
     end_rank: u64,
+    steps_per_thread: u32,
+    threads_per_batch: u32,
 ) -> (Vec<Vec<u8>>, bool) {
     let mut current_rank = start_rank;
     let mut found_rulers = Vec::new();
 
-    const STEPS_PER_THREAD: u32 = 2048;
-    const THREADS_PER_BATCH: u32 = 131072;
-    let total_steps_per_batch = (STEPS_PER_THREAD as u64) * (THREADS_PER_BATCH as u64);
+    let total_steps_per_batch = (steps_per_thread as u64) * (threads_per_batch as u64);
 
     let mut in_flight = std::collections::VecDeque::new();
     const MAX_IN_FLIGHT: usize = 2;
@@ -487,9 +496,9 @@ fn gpu_search_range(
 
             let remaining = end_rank - current_rank;
             let this_batch_threads = if remaining >= total_steps_per_batch {
-                THREADS_PER_BATCH
+                threads_per_batch
             } else {
-                remaining.div_ceil(STEPS_PER_THREAD as u64) as u32
+                remaining.div_ceil(steps_per_thread as u64) as u32
             };
 
             let params = SearchParams {
@@ -498,12 +507,12 @@ fn gpu_search_range(
                 batch_size: this_batch_threads,
                 start_rank_low: (current_rank & 0xFFFFFFFF) as u32,
                 start_rank_high: (current_rank >> 32) as u32,
-                steps_per_thread: STEPS_PER_THREAD,
+                steps_per_thread,
                 _padding: [0; 2],
             };
 
             let task = gpu.submit_search(&params);
-            let processed = (this_batch_threads as u64) * (STEPS_PER_THREAD as u64);
+            let processed = (this_batch_threads as u64) * (steps_per_thread as u64);
             in_flight.push_back((task, processed.min(remaining)));
             current_rank += processed.min(remaining);
         }

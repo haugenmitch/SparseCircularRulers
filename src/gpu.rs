@@ -16,6 +16,35 @@ pub struct SearchParams {
     pub _padding: [u32; 2],
 }
 
+pub struct GpuConfig {
+    pub steps_per_thread: u32,
+    pub threads_per_batch: u32,
+}
+
+impl GpuConfig {
+    pub fn for_length(length: u32) -> Self {
+        if length < 70 {
+            // Small lengths: Low complexity, reduce launch overhead
+            Self {
+                steps_per_thread: 1024,
+                threads_per_batch: 131072,
+            }
+        } else if length < 110 {
+            // Medium lengths: Divergence starts, lower steps for better scheduling
+            Self {
+                steps_per_thread: 128,
+                threads_per_batch: 1048576,
+            }
+        } else {
+            // Large lengths: Maximize throughput with very large batches
+            Self {
+                steps_per_thread: 128,
+                threads_per_batch: 2097152,
+            }
+        }
+    }
+}
+
 pub struct GpuBuffers {
     pub params_buffer: wgpu::Buffer,
     pub results_buffer: wgpu::Buffer,
@@ -255,6 +284,11 @@ impl GpuContext {
                 label: Some("Compute Encoder"),
             });
 
+        let workgroup_size: u32 = std::env::var("GPU_WORKGROUP_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Compute Pass"),
@@ -262,7 +296,7 @@ impl GpuContext {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &bufs.bind_group, &[]);
-            let workgroup_count = params.batch_size.div_ceil(256);
+            let workgroup_count = params.batch_size.div_ceil(workgroup_size);
             if workgroup_count <= 65535 {
                 compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
             } else {
