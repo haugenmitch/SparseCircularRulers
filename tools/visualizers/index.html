@@ -1,0 +1,1928 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sparse Circular Ruler Visualizer</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+
+        /* Color definitions */
+        :root {
+            --bg-body: #404040;
+            --bg-card: #262626;
+            --bg-input: #1a1a1a;
+            --bg-header: #2e2e2e;
+
+            --color-text: #f0f0f0;
+            --color-red: #f08080;
+            --color-green: #7fe97f;
+            --color-blue: #7cb2f0;
+            --color-muted: #888888;
+            --color-border: #555555;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-body);
+            color: var(--color-text);
+            font-family: 'JetBrains Mono', monospace;
+            padding: 30px 15px;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        /* Banner */
+        .banner-pre {
+            color: var(--color-blue);
+            font-size: 9.5px;
+            line-height: 1.2;
+            overflow-x: auto;
+            margin-bottom: 5px;
+            font-weight: bold;
+            text-shadow: 0 0 10px rgba(124, 178, 240, 0.2);
+            white-space: pre;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--color-muted);
+            margin-bottom: 30px;
+            text-align: center;
+            border-bottom: 2px dashed var(--color-border);
+            padding-bottom: 15px;
+        }
+
+        /* Card panels */
+        .card {
+            background-color: var(--bg-card);
+            border: 2px solid var(--color-border);
+            border-radius: 4px;
+            box-shadow: 4px 4px 0px #111111;
+            padding: 20px;
+            margin-bottom: 25px;
+        }
+
+        .card-header {
+            color: var(--color-blue);
+            font-weight: bold;
+            font-size: 16px;
+            border-bottom: 2px dashed var(--color-border);
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Input control row */
+        .input-row {
+            display: flex;
+            gap: 12px;
+            width: 100%;
+            margin-bottom: 15px;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        input[type="text"] {
+            background-color: var(--bg-input);
+            border: 2px solid var(--color-border);
+            color: var(--color-green);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 16px;
+            padding: 10px 15px;
+            width: 100%;
+            border-radius: 4px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--color-blue);
+        }
+
+        /* Buttons */
+        .btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: bold;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            border: 2px solid;
+            box-shadow: 3px 3px 0px #111111;
+            transition: all 0.1s ease;
+            outline: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            white-space: nowrap;
+        }
+
+        .btn:active {
+            transform: translate(2px, 2px);
+            box-shadow: 1px 1px 0px #111111;
+        }
+
+        .btn-primary {
+            background-color: var(--color-blue);
+            border-color: #5b92d0;
+            color: #111111;
+        }
+
+        .btn-primary:hover {
+            background-color: #9ac2f3;
+        }
+
+        .btn-success {
+            background-color: var(--color-green);
+            border-color: #5cc45c;
+            color: #111111;
+        }
+
+        .btn-success:hover {
+            background-color: #9eee9e;
+        }
+
+        @media (max-width: 650px) {
+            .input-row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .btn {
+                width: 100%;
+            }
+        }
+
+        /* Presets list */
+        .presets-title {
+            font-size: 12px;
+            color: var(--color-muted);
+            margin-bottom: 8px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .presets-list {
+            margin-bottom: 5px;
+        }
+
+        .preset-badge {
+            background-color: #333333;
+            border: 1px solid var(--color-border);
+            color: #cccccc;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            display: inline-block;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            transition: all 0.15s;
+        }
+
+        .preset-badge:hover {
+            background-color: var(--color-blue);
+            color: #111111;
+            border-color: var(--color-blue);
+        }
+
+        /* Error/Alert box */
+        .alert {
+            background-color: rgba(240, 128, 128, 0.1);
+            border: 2px solid var(--color-red);
+            color: var(--color-red);
+            padding: 12px 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            display: none;
+            font-size: 14px;
+        }
+
+        /* Main layout grid */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 25px;
+            align-items: start;
+        }
+
+        @media (max-width: 850px) {
+            .main-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Stats & Status items */
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #333333;
+            font-size: 14px;
+        }
+
+        .stat-label {
+            color: var(--color-muted);
+        }
+
+        .stat-value {
+            font-weight: bold;
+        }
+
+        .stat-value.yes {
+            color: var(--color-green);
+        }
+
+        .stat-value.no {
+            color: var(--color-red);
+        }
+
+        .stat-value.maybe {
+            color: var(--color-blue);
+        }
+
+        /* Terminal status line */
+        #terminal-status {
+            background-color: var(--bg-input);
+            border-left: 4px solid var(--color-blue);
+            padding: 10px 15px;
+            color: var(--color-blue);
+            font-size: 13px;
+            margin-bottom: 20px;
+            min-height: 40px;
+            display: flex;
+            align-items: center;
+            border-radius: 0 4px 4px 0;
+        }
+
+        /* Achieved lengths grid */
+        .lengths-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(50px, 1fr));
+            gap: 6px;
+            margin-top: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+            padding-right: 5px;
+            border: 1px solid #333333;
+            padding: 10px;
+            background-color: var(--bg-input);
+            border-radius: 4px;
+        }
+
+        .length-pill {
+            padding: 4px;
+            text-align: center;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.15s;
+            border: 1px solid transparent;
+        }
+
+        .length-pill.achieved {
+            background-color: rgba(127, 233, 127, 0.12);
+            border-color: rgba(127, 233, 127, 0.4);
+            color: var(--color-green);
+        }
+
+        .length-pill.achieved:hover,
+        .length-pill.achieved.active-highlight {
+            background-color: var(--color-green);
+            color: #111111;
+            border-color: var(--color-green);
+            box-shadow: 0 0 8px rgba(127, 233, 127, 0.5);
+        }
+
+        .length-pill.missing {
+            background-color: rgba(240, 128, 128, 0.12);
+            border-color: rgba(240, 128, 128, 0.4);
+            color: var(--color-red);
+        }
+
+        .length-pill.missing:hover {
+            background-color: var(--color-red);
+            color: #111111;
+            border-color: var(--color-red);
+            box-shadow: 0 0 8px rgba(240, 128, 128, 0.5);
+        }
+
+        /* Visualizer Panel (SVG) */
+        .visualizer-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: var(--bg-input);
+            border: 2px solid var(--color-border);
+            border-radius: 4px;
+            padding: 10px;
+            height: 380px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        svg#ruler-svg {
+            width: 100%;
+            height: 100%;
+            max-width: 360px;
+            max-height: 360px;
+        }
+
+        /* SVG styles */
+        .svg-ring-bg {
+            fill: none;
+            stroke: #2a2a2a;
+            stroke-width: 12;
+        }
+
+        .svg-ring {
+            fill: none;
+            stroke: #333333;
+            stroke-width: 6;
+        }
+
+        .svg-tick {
+            stroke: #888888;
+            stroke-width: 1;
+        }
+
+        .svg-tick-mark {
+            stroke: #dddddd;
+            stroke-width: 2.5;
+        }
+
+        .svg-tick-mark.highlighted {
+            stroke: var(--color-blue);
+            stroke-width: 4.5;
+            filter: drop-shadow(0 0 3px var(--color-blue));
+        }
+
+        .svg-mark-label {
+            fill: #dddddd;
+            font-size: 11px;
+            font-weight: bold;
+            text-anchor: middle;
+            dominant-baseline: middle;
+            paint-order: stroke fill;
+            stroke: var(--bg-input);
+            stroke-width: 2px;
+        }
+
+        .svg-mark-label.highlighted {
+            fill: var(--color-blue);
+            font-size: 13px;
+        }
+
+        .svg-sector-divider {
+            stroke: #222222;
+            stroke-width: 2.5;
+        }
+
+        .svg-segment-arc {
+            fill: none;
+            stroke-width: 14;
+            /* Thicker segment dial */
+            cursor: pointer;
+            transition: stroke-width 0.15s, filter 0.15s;
+        }
+
+        .svg-segment-arc:hover {
+            stroke-width: 18;
+            filter: brightness(1.2) drop-shadow(0 0 4px currentColor);
+        }
+
+        .svg-segment-label {
+            font-size: 11px;
+            font-weight: bold;
+            text-anchor: middle;
+            dominant-baseline: middle;
+            fill: var(--color-text);
+            pointer-events: none;
+            paint-order: stroke fill;
+            stroke: #1a1a1a;
+            stroke-width: 3px;
+            /* outlined text to prevent illegible black on dark background markings */
+        }
+
+        .svg-highlight-overlay {
+            fill: none;
+            stroke: var(--color-blue);
+            stroke-width: 16;
+            stroke-linecap: round;
+            opacity: 0;
+            transition: opacity 0.2s;
+            filter: drop-shadow(0 0 6px var(--color-blue));
+            pointer-events: none;
+        }
+
+        .svg-highlight-overlay.active {
+            opacity: 0.85;
+        }
+
+        .svg-center-text-label {
+            fill: var(--color-muted);
+            font-size: 12px;
+            text-anchor: middle;
+            dominant-baseline: middle;
+        }
+
+        .svg-center-text-value {
+            fill: var(--color-blue);
+            font-size: 28px;
+            font-weight: bold;
+            text-anchor: middle;
+            dominant-baseline: middle;
+        }
+
+        /* Matrix Table Card */
+        .table-responsive {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid var(--color-border);
+            border-radius: 4px;
+            background-color: var(--bg-input);
+        }
+
+        table.ruler-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+
+        table.ruler-table th,
+        table.ruler-table td {
+            border: 1px solid var(--color-border);
+            padding: 8px 10px;
+            text-align: center;
+            min-width: 75px;
+            height: 48px;
+        }
+
+        table.ruler-table th {
+            background-color: var(--bg-header);
+            color: var(--color-blue);
+            font-weight: 700;
+        }
+
+        table.ruler-table th.corner {
+            color: var(--color-muted);
+            font-size: 11px;
+            font-weight: normal;
+        }
+
+        table.ruler-table td {
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        table.ruler-table td.cell-unique {
+            background-color: var(--color-green);
+            color: #111111;
+        }
+
+        .cell-subtext {
+            display: block;
+            font-size: 9px;
+            font-weight: normal;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+
+        /* Hover effect highlight classes */
+        .row-highlight {
+            background-color: rgba(124, 178, 240, 0.08) !important;
+        }
+
+        .col-highlight {
+            background-color: rgba(124, 178, 240, 0.08) !important;
+        }
+
+        .cell-highlight {
+            background-color: var(--color-blue) !important;
+            color: #111111 !important;
+            box-shadow: 0 0 10px rgba(124, 178, 240, 0.6);
+            transform: scale(1.05);
+            z-index: 2;
+            position: relative;
+        }
+
+        /* Graph Panel Styling */
+        .graph-link {
+            stroke: #444444;
+            stroke-width: 1.5;
+            stroke-dasharray: 3, 3;
+            transition: stroke 0.2s, stroke-width 0.2s;
+        }
+
+        .graph-link.highlighted {
+            stroke: var(--color-blue);
+            stroke-width: 3;
+            stroke-dasharray: none;
+        }
+
+        .graph-node-group {
+            cursor: pointer;
+            transition: transform 0.15s, filter 0.15s;
+            transform-origin: 0px 0px;
+        }
+
+        .graph-node-group:hover {
+            transform: scale(1.06);
+            filter: drop-shadow(0 0 5px var(--color-blue));
+        }
+
+        .graph-node-rect {
+            stroke-width: 1.5;
+            stroke: #222222;
+            transition: stroke-width 0.15s, stroke 0.15s;
+        }
+
+        .graph-node-group:hover .graph-node-rect {
+            stroke: var(--color-blue);
+            stroke-width: 2.5;
+        }
+
+        .graph-node-text {
+            font-size: 11px;
+            font-weight: bold;
+            text-anchor: middle;
+            dominant-baseline: middle;
+            pointer-events: none;
+            fill: #111111;
+            transition: fill 0.15s;
+        }
+
+        .graph-node-group:hover .graph-node-text {
+            fill: #ffffff;
+        }
+
+        .graph-node-rect.complete-minimal {
+            fill: var(--color-green);
+        }
+
+        .graph-node-rect.complete-not-minimal {
+            fill: var(--color-blue);
+        }
+
+        .graph-node-rect.current {
+            fill: var(--bg-card);
+            stroke: var(--color-blue);
+            stroke-width: 3;
+        }
+
+        .graph-node-text.current {
+            fill: var(--color-blue);
+        }
+
+        /* Footer */
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            padding-top: 20px;
+            border-top: 2px dashed var(--color-border);
+        }
+
+        .share-btn-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 25px;
+        }
+
+        .btn-share {
+            padding: 14px 30px;
+            font-size: 16px;
+            letter-spacing: 0.5px;
+        }
+
+        .copyright {
+            font-size: 11px;
+            color: var(--color-muted);
+        }
+
+        /* Scrollbar styles */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-card);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--color-border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--color-blue);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- ASCII Banner Header -->
+        <pre class="banner-pre">
+ ____  ____   _   ____  ____ _____    ____ ___ ____   ____ _   _ _        _    ____  
+/ ___||  _ \ / \ |  _ \/ ___| ____|  / ___|_ _|  _ \ / ___| | | | |      / \  |  _ \ 
+\___ \| |_) / _ \| |_) \___ \  _|   | |    | || |_) | |   | | | | |     / _ \ | |_) |
+ ___) |  __/ ___ \  _ < ___) | |___  | |___ | ||  _ <| |___| |_| | |___ / ___ \|  _ < 
+|____/|_| /_/   \_\_| \_\____/|_____|  \____|___|_| \_\\____|\___/|_____/_/   \_\_| \_\
+
+                    ____  _   _ _     _____ ____  ____  
+                   |  _ \| | | | |   | ____|  _ \/ ___| 
+                   | |_) | | | | |   |  _| | |_) \___ \ 
+                   |  _ <| |_| | |___| |___|  _ < ___) |
+                   |_| \_\\___/|_____|_____|_| \_\____/ </pre>
+        <div class="subtitle">[ SYSTEM <span id="tool-version">v0.9.3</span> ] // COMPLETE SPARSE CIRCULAR RULER ANALYZER</div>
+
+        <!-- Error Alert -->
+        <div class="alert" id="error-alert">
+            <strong>ERROR:</strong> <span id="error-text">Invalid input sequence.</span>
+        </div>
+
+        <!-- Upper Control Panel -->
+        <div class="card">
+            <div class="card-header">
+                <span>[ RULER DEFINITION INPUT ]</span>
+            </div>
+
+            <div class="input-row">
+                <div class="input-wrapper">
+                    <input type="text" id="ruler-input" value="1, 2, 3" placeholder="e.g. 1, 2, 3 or 1 2 6 4"
+                        autocomplete="off">
+                </div>
+                <button type="button" class="btn btn-primary" id="btn-analyze">&gt;_ ANALYZE</button>
+                <button type="button" class="btn btn-success" id="btn-canonicalize">* CANONICALIZE</button>
+            </div>
+
+            <div class="presets-title">Presets:</div>
+            <div class="presets-list" id="presets-container">
+                <!-- Preset Badges will load here -->
+            </div>
+        </div>
+
+        <!-- Status & Visualizer Layout -->
+        <div class="main-layout">
+            <!-- Left Panel: Circle SVG Visualizer (Swapped placement) -->
+            <div class="card" style="min-height: 485px;">
+                <div class="card-header">
+                    <span>[ CIRCULAR REPRESENTATION DIAL ]</span>
+                </div>
+
+                <div class="visualizer-container">
+                    <svg id="ruler-svg" viewBox="0 0 400 400">
+                        <!-- Ring Background -->
+                        <circle class="svg-ring-bg" cx="200" cy="200" r="130"></circle>
+                        <circle class="svg-ring" cx="200" cy="200" r="130"></circle>
+
+                        <!-- Groups for dynamic updates -->
+                        <g id="svg-ticks"></g>
+                        <g id="svg-segment-arcs"></g>
+                        <g id="svg-sector-dividers"></g>
+                        <g id="svg-mark-labels"></g>
+
+                        <!-- Highlight Arc Overlay -->
+                        <path id="svg-highlight-overlay" class="svg-highlight-overlay" d=""></path>
+
+                        <!-- Center Display -->
+                        <g transform="translate(200, 200)">
+                            <text y="-18" class="svg-center-text-label">LENGTH (L)</text>
+                            <text y="15" id="svg-center-value" class="svg-center-text-value">0</text>
+                            <text y="42" id="svg-center-sub" class="svg-center-text-label">0 segments</text>
+                        </g>
+                    </svg>
+                </div>
+            </div>
+
+            <!-- Right Panel: Summary & Metrics (Swapped placement) -->
+            <div class="card" style="min-height: 485px; display: flex; flex-direction: column;">
+                <div class="card-header">
+                    <span>[ METRICS & COMPLETENESS ]</span>
+                </div>
+
+                <div style="flex-grow: 1;">
+                    <!-- Ruler Properties Stats Table -->
+                    <div class="stat-row">
+                        <span class="stat-label">Total Length (L):</span>
+                        <span class="stat-value" id="stat-length">-</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Number of Segments (k):</span>
+                        <span class="stat-value" id="stat-segments">-</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Minimality Lower Bound:</span>
+                        <span class="stat-value" id="stat-lower-bound">-</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Minimality Upper Bound:</span>
+                        <span class="stat-value" id="stat-upper-bound">-</span>
+                    </div>
+
+                    <!-- Line Items instead of Checkboxes -->
+                    <div class="stat-row">
+                        <span class="stat-label">Complete:</span>
+                        <span class="stat-value" id="stat-complete">-</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Minimal:</span>
+                        <span class="stat-value" id="stat-minimal">-</span>
+                    </div>
+                </div>
+
+                <!-- Live status terminal log -->
+                <div id="terminal-status">$ Idle. Enter a ruler above to start analysis.</div>
+
+                <div class="presets-title">MEASURABLE DISTANCES (1 .. L):</div>
+                <div class="lengths-grid" id="lengths-container">
+                    <!-- Length cells will load here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Lower Section: Transition Matrix Table -->
+        <div class="card">
+            <div class="card-header">
+                <span>[ SEGMENT DISTANCE TRANSITION MATRIX ]</span>
+                <span style="font-size:12px; color:var(--color-muted);">HOVER CELLS TO TRACE ROUTE</span>
+            </div>
+            <div class="table-responsive">
+                <table class="ruler-table" id="matrix-table">
+                    <thead>
+                        <tr id="matrix-header-row">
+                            <!-- Headers dynamically revamp to show starting segments and counts -->
+                        </tr>
+                    </thead>
+                    <tbody id="matrix-body">
+                        <!-- Matrix rows will dynamically load here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Exploration Graph Panel -->
+        <div class="card">
+            <div class="card-header">
+                <span>[ RULER SPACE EXPLORATION GRAPH ]</span>
+                <span style="font-size:12px; color:var(--color-muted);">CLICK NODES TO EXPLORE NEIGHBORS</span>
+            </div>
+            <div class="visualizer-container"
+                style="height: 500px; display: block; overflow: auto; text-align: center;">
+                <svg id="exploration-svg" viewBox="0 0 800 460"
+                    style="width: 100%; height: 100%; max-width: 800px; background-color: var(--bg-input); border-radius: 4px; border: 1px solid var(--color-border);">
+                    <g id="graph-links"></g>
+                    <g id="graph-nodes"></g>
+                </svg>
+            </div>
+        </div>
+
+        <!-- Footer with Share Ruler Button -->
+        <div class="footer">
+            <div class="share-btn-container">
+                <a class="btn btn-success btn-share" href="solution_graph.html" style="margin-right: 12px; text-decoration: none;">OPEN 3D SOLUTION GRAPH</a>
+                <button type="button" class="btn btn-primary btn-share" id="btn-share">SHARE THIS RULER (EMAIL
+                    LOG)</button>
+            </div>
+            <div class="copyright">
+                SPARSE CIRCULAR RULERS ANALYZER // MCH RETRO WEB SUITE // MITCHELLHAUGEN.COM
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Preset rulers (both complete and incomplete for demonstration)
+        const RULER_PRESETS = [
+            { name: "[1, 2, 3] (L=6, k=3, Complete)", seq: [1, 2, 3] },
+            { name: "[1, 3, 2, 7] (L=13, k=4, Complete)", seq: [1, 3, 2, 7] },
+            { name: "[1, 3, 10, 2, 5] (L=21, k=5, Complete)", seq: [1, 3, 10, 2, 5] },
+            { name: "[1, 2, 5, 4, 6, 13] (L=31, k=6, Complete)", seq: [1, 2, 5, 4, 6, 13] },
+            { name: "[1, 2, 10, 19, 4, 7, 9, 5] (L=57, k=8, Complete)", seq: [1, 2, 10, 19, 4, 7, 9, 5] },
+            { name: "[1, 2, 6, 18, 22, 7, 5, 16, 4, 10] (L=91, k=10, Complete)", seq: [1, 2, 6, 18, 22, 7, 5, 16, 4, 10] },
+            { name: "[1, 3, 8, 12, 7] (L=31, k=5, Incomplete Demo)", seq: [1, 3, 8, 12, 7] },
+            { name: "[2, 2, 2] (L=6, k=3, Incomplete Demo)", seq: [2, 2, 2] }
+        ];
+
+        // Hardcoded minimal number of segments up to length 100 (OEIS A283297)
+        // Index is length (L). Value is minimum number of segments (k).
+        const MINIMAL_SEGMENTS_UP_TO_100 = [
+            0, // L=0
+            1, 2, 2, 3, 3, 3, 3, 4, 4, 4, // L=1..10
+            4, 4, 4, 5, 5, 5, 5, 5, 5, 6, // L=11..20
+            5, 6, 6, 6, 6, 6, 6, 6, 7, 7, // L=21..30
+            6, 7, 7, 7, 7, 7, 7, 8, 7, 8, // L=31..40
+            8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // L=41..50
+            8, 9, 9, 9, 9, 9, 8, 9, 9, 9, // L=51..60
+            9, 9, 9, 9, 9, 10, 10, 10, 10, 10, // L=61..70
+            10, 10, 9, 10, 10, 10, 10, 10, 10, 11, // L=71..80
+            11, 11, 11, 11, 11, 11, 11, 11, 11, 11, // L=81..90
+            10, 11, 11, 12, 11, 12, 12, 12, 12, 12  // L=91..100
+        ];
+
+        // Set up DOM elements
+        const rulerInput = document.getElementById('ruler-input');
+        const btnAnalyze = document.getElementById('btn-analyze');
+        const btnCanonicalize = document.getElementById('btn-canonicalize');
+        const btnShare = document.getElementById('btn-share');
+        const errorAlert = document.getElementById('error-alert');
+        const errorText = document.getElementById('error-text');
+
+        const statLength = document.getElementById('stat-length');
+        const statSegments = document.getElementById('stat-segments');
+        const statLowerBound = document.getElementById('stat-lower-bound');
+        const statUpperBound = document.getElementById('stat-upper-bound');
+
+        const statComplete = document.getElementById('stat-complete');
+        const statMinimal = document.getElementById('stat-minimal');
+
+        const terminalStatus = document.getElementById('terminal-status');
+        const lengthsContainer = document.getElementById('lengths-container');
+        const presetsContainer = document.getElementById('presets-container');
+
+        // SVG Elements
+        const rulerSvg = document.getElementById('ruler-svg');
+        const svgTicks = document.getElementById('svg-ticks');
+        const svgSegmentArcs = document.getElementById('svg-segment-arcs');
+        const svgSectorDividers = document.getElementById('svg-sector-dividers');
+        const svgMarkLabels = document.getElementById('svg-mark-labels');
+        const svgHighlightOverlay = document.getElementById('svg-highlight-overlay');
+        const svgCenterValue = document.getElementById('svg-center-value');
+        const svgCenterSub = document.getElementById('svg-center-sub');
+
+        // Matrix table elements
+        const matrixHeaderRow = document.getElementById('matrix-header-row');
+        const matrixBody = document.getElementById('matrix-body');
+
+        // Current state
+        let currentRuler = [];
+        let currentL = 0;
+        let currentK = 0;
+        let achievedDistances = new Set();
+        let distancePathsMap = new Map(); // Maps distance -> array of {startIdx, count}
+
+        // Initialize presets in UI
+        function loadPresets() {
+            presetsContainer.innerHTML = '';
+            RULER_PRESETS.forEach(preset => {
+                const badge = document.createElement('span');
+                badge.className = 'preset-badge';
+                badge.textContent = preset.name;
+                badge.addEventListener('click', () => {
+                    rulerInput.value = preset.seq.join(', ');
+                    analyzeCurrentRuler();
+                });
+                presetsContainer.appendChild(badge);
+            });
+        }
+
+        // Parse input string into positive integers array
+        function parseRulerInput(inputStr) {
+            const cleaned = inputStr.replace(/[\[\]]/g, '').replace(/[,;\t]/g, ' ');
+            const parts = cleaned.trim().split(/\s+/).filter(p => p !== '');
+
+            if (parts.length === 0) {
+                throw new Error("Input string is empty. Please enter positive integers.");
+            }
+
+            const seq = [];
+            for (let i = 0; i < parts.length; i++) {
+                const val = Number(parts[i]);
+                if (isNaN(val)) {
+                    throw new Error(`"${parts[i]}" is not a valid number.`);
+                }
+                if (!Number.isInteger(val)) {
+                    throw new Error(`"${parts[i]}" is not an integer. Only integers are allowed.`);
+                }
+                if (val <= 0) {
+                    throw new Error(`"${parts[i]}" is not a positive integer. Segments must be greater than zero.`);
+                }
+                seq.push(val);
+            }
+            return seq;
+        }
+
+        // Calculate cyclic sum of 'numSegs' segments starting from startIdx
+        function getLengthBetweenSegments(ruler, startIdx, numSegs) {
+            const k = ruler.length;
+            let sum = 0;
+            for (let m = 0; m < numSegs; m++) {
+                sum += ruler[(startIdx + m) % k];
+            }
+            return sum;
+        }
+
+        // Lexicographical canonicalization
+        function getCanonical(ruler) {
+            const n = ruler.length;
+            if (n <= 1) return [...ruler];
+
+            const permutations = [];
+
+            // All rotations
+            for (let i = 0; i < n; i++) {
+                const rot = [];
+                for (let j = 0; j < n; j++) {
+                    rot.push(ruler[(i + j) % n]);
+                }
+                permutations.push(rot);
+            }
+
+            // All reflections (rotations of reversed)
+            const reversed = [...ruler].reverse();
+            for (let i = 0; i < n; i++) {
+                const rot = [];
+                for (let j = 0; j < n; j++) {
+                    rot.push(reversed[(i + j) % n]);
+                }
+                permutations.push(rot);
+            }
+
+            // Sort permutations lexicographically
+            permutations.sort((a, b) => {
+                for (let i = 0; i < n; i++) {
+                    if (a[i] !== b[i]) {
+                        return a[i] - b[i];
+                    }
+                }
+                return 0;
+            });
+
+            return permutations[0];
+        }
+
+        // Run full analysis on the current input ruler
+        function analyzeCurrentRuler() {
+            errorAlert.style.display = 'none';
+            try {
+                const parsed = parseRulerInput(rulerInput.value);
+                currentRuler = parsed;
+                currentK = parsed.length;
+                currentL = parsed.reduce((sum, val) => sum + val, 0);
+
+                // Clear state
+                achievedDistances.clear();
+                distancePathsMap.clear();
+
+                // Calculate all achievable cyclic distances
+                // Using revamp rules: columns are segment count from 1 to k-1 (or k)
+                for (let startIdx = 0; startIdx < currentK; startIdx++) {
+                    for (let count = 1; count <= currentK; count++) {
+                        const sum = getLengthBetweenSegments(currentRuler, startIdx, count);
+
+                        achievedDistances.add(sum);
+
+                        if (!distancePathsMap.has(sum)) {
+                            distancePathsMap.set(sum, []);
+                        }
+                        distancePathsMap.get(sum).push({
+                            start: startIdx,
+                            count: count
+                        });
+                    }
+                }
+
+                updateMetricsUI();
+                renderSVGVisualizer();
+                renderMatrixTable();
+                renderLengthsGrid();
+                renderExplorationGraph();
+
+                setTerminalMessage(`$ Ruler [${currentRuler.join(', ')}] successfully analyzed. L=${currentL}, k=${currentK}.`);
+
+            } catch (err) {
+                showError(err.message);
+                setTerminalMessage(`$ ERROR: Failed to analyze ruler. ${err.message}`);
+            }
+        }
+
+        // Show parsing error alert
+        function showError(msg) {
+            errorText.textContent = msg;
+            errorAlert.style.display = 'block';
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        // Set terminal emulator status line
+        function setTerminalMessage(msg) {
+            terminalStatus.textContent = msg;
+        }
+
+        // Helper to check if ruler is complete
+        function checkCompleteness() {
+            if (currentL <= 1) return false;
+            for (let d = 1; d < currentL; d++) {
+                if (!achievedDistances.has(d)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Update metrics and line items
+        function updateMetricsUI() {
+            statLength.textContent = currentL;
+            statSegments.textContent = currentK;
+
+            // Bounds formulas
+            const lb = Math.ceil((Math.sqrt(4 * currentL - 3) + 1) / 2);
+            statLowerBound.textContent = lb;
+
+            const ub = Math.floor(Math.sqrt(2 * currentL));
+            statUpperBound.textContent = currentL <= 4 ? lb : ub;
+
+            // Calculate Completeness
+            const isComplete = checkCompleteness();
+            if (isComplete) {
+                statComplete.textContent = "YES";
+                statComplete.className = "stat-value yes";
+                statComplete.setAttribute('title', "All distances 1.." + (currentL - 1) + " are measurable");
+            } else {
+                statComplete.textContent = "NO";
+                statComplete.className = "stat-value no";
+                statComplete.setAttribute('title', "Some distances are missing");
+            }
+
+            // Calculate Minimality
+            let minimality = "No";
+            if (isComplete) {
+                if (currentL <= 100) {
+                    const minK = MINIMAL_SEGMENTS_UP_TO_100[currentL];
+                    minimality = (currentK === minK) ? "Yes" : "No";
+                } else {
+                    if (currentK === lb) {
+                        minimality = "Yes";
+                    } else if (currentK > ub) {
+                        minimality = "No";
+                    } else {
+                        minimality = "Maybe";
+                    }
+                }
+            } else {
+                minimality = "No";
+            }
+
+            // Set text label based on minimality
+            if (minimality === "Yes") {
+                statMinimal.textContent = "YES";
+                statMinimal.className = "stat-value yes";
+                statMinimal.setAttribute('title', "Achieves completeness with absolute minimum segments");
+            } else if (minimality === "No") {
+                const targetText = currentL <= 100 ? MINIMAL_SEGMENTS_UP_TO_100[currentL] : '≤' + ub;
+                statMinimal.textContent = "NO";
+                statMinimal.className = "stat-value no";
+                statMinimal.setAttribute('title', `Complete rulers exist with fewer segments, target is ${targetText}`);
+            } else {
+                statMinimal.textContent = "MAYBE";
+                statMinimal.className = "stat-value maybe";
+                statMinimal.setAttribute('title', `k satisfies bounds: ${lb} ≤ k ≤ ${ub}`);
+            }
+        }
+
+        // Render Circular SVG dial representing ruler segment marks
+        function renderSVGVisualizer() {
+            // Reset contents
+            svgTicks.innerHTML = '';
+            svgSegmentArcs.innerHTML = '';
+            svgSectorDividers.innerHTML = '';
+            svgMarkLabels.innerHTML = '';
+            svgHighlightOverlay.classList.remove('active');
+
+            // Set values inside the circle
+            svgCenterValue.textContent = currentL;
+            svgCenterSub.textContent = `${currentK} segments`;
+
+            const Cx = 200;
+            const Cy = 200;
+            const R_dial = 130;
+
+            // Calculate absolute marks coordinates
+            const marks = [0];
+            let acc = 0;
+            for (let i = 0; i < currentK - 1; i++) {
+                acc += currentRuler[i];
+                marks.push(acc);
+            }
+
+            // 1. Draw individual ticks around dial for all units 0..L-1
+            for (let x = 0; x < currentL; x++) {
+                const angle = (2 * Math.PI * x) / currentL - Math.PI / 2;
+                const isMark = marks.includes(x);
+
+                const tickLength = isMark ? 14 : 7;
+                const rStart = R_dial - tickLength;
+                const rEnd = R_dial;
+
+                const x1 = Cx + rStart * Math.cos(angle);
+                const y1 = Cy + rStart * Math.sin(angle);
+                const x2 = Cx + rEnd * Math.cos(angle);
+                const y2 = Cy + rEnd * Math.sin(angle);
+
+                const tick = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                tick.setAttribute("x1", x1);
+                tick.setAttribute("y1", y1);
+                tick.setAttribute("x2", x2);
+                tick.setAttribute("y2", y2);
+
+                if (isMark) {
+                    tick.setAttribute("class", "svg-tick-mark");
+                    tick.setAttribute("id", `svg-tick-mark-${x}`);
+                } else {
+                    tick.setAttribute("class", "svg-tick");
+                }
+                svgTicks.appendChild(tick);
+            }
+
+            // 2. Draw colorful segment arcs around the dial
+            const arcColors = [
+                '#7cb2f0', '#fbcfe8', '#fed7aa', '#d8b4fe',
+                '#fef08a', '#99f6e4', '#e9d5ff', '#fdba74'
+            ];
+
+            let currentSum = 0;
+            for (let i = 0; i < currentK; i++) {
+                const segVal = currentRuler[i];
+                const startVal = currentSum;
+                const endVal = currentSum + segVal;
+                currentSum = endVal;
+
+                const startAngle = (2 * Math.PI * startVal) / currentL - Math.PI / 2;
+                const endAngle = (2 * Math.PI * endVal) / currentL - Math.PI / 2;
+
+                const xStart = Cx + R_dial * Math.cos(startAngle);
+                const yStart = Cy + R_dial * Math.sin(startAngle);
+                const xEnd = Cx + R_dial * Math.cos(endAngle);
+                const yEnd = Cy + R_dial * Math.sin(endAngle);
+
+                const largeArc = (segVal > currentL / 2) ? 1 : 0;
+
+                let d = "";
+                if (segVal === currentL) {
+                    d = `M ${Cx} ${Cy - R_dial} A ${R_dial} ${R_dial} 0 1 1 ${Cx} ${Cy + R_dial} A ${R_dial} ${R_dial} 0 1 1 ${Cx} ${Cy - R_dial}`;
+                } else {
+                    d = `M ${xStart} ${yStart} A ${R_dial} ${R_dial} 0 ${largeArc} 1 ${xEnd} ${yEnd}`;
+                }
+
+                const color = arcColors[i % arcColors.length];
+
+                // Draw arc path (thicker segment)
+                const arcPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                arcPath.setAttribute("d", d);
+                arcPath.setAttribute("class", "svg-segment-arc");
+                arcPath.setAttribute("stroke", color);
+                arcPath.setAttribute("id", `svg-segment-arc-${i}`);
+
+                arcPath.addEventListener('mouseenter', () => {
+                    highlightMatrixPath(i, 1);
+                    setTerminalMessage(`$ Inspecting segment s${i}: length = ${segVal} (from coordinate ${startVal} to ${endVal % currentL})`);
+                });
+
+                arcPath.addEventListener('mouseleave', () => {
+                    clearTableHighlights();
+                    setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+                });
+
+                svgSegmentArcs.appendChild(arcPath);
+
+                // 3. Draw dividing line (radial line) at marks
+                const rStartLine = R_dial - 25;
+                const rEndLine = R_dial;
+                const lx1 = Cx + rStartLine * Math.cos(startAngle);
+                const ly1 = Cy + rStartLine * Math.sin(startAngle);
+                const lx2 = Cx + rEndLine * Math.cos(startAngle);
+                const ly2 = Cy + rEndLine * Math.sin(startAngle);
+
+                const divider = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                divider.setAttribute("x1", lx1);
+                divider.setAttribute("y1", ly1);
+                divider.setAttribute("x2", lx2);
+                divider.setAttribute("y2", ly2);
+                divider.setAttribute("class", "svg-sector-divider");
+                svgSectorDividers.appendChild(divider);
+
+                // 4. Labels inside the sectors (outlined text to prevent illegible black markings)
+                const midAngle = startAngle + (endAngle - startAngle) / 2 + (startAngle > endAngle ? Math.PI : 0);
+                const rLabel = R_dial - 22;
+                const lxLabel = Cx + rLabel * Math.cos(midAngle);
+                const lyLabel = Cy + rLabel * Math.sin(midAngle);
+
+                const textLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                textLabel.setAttribute("x", lxLabel);
+                textLabel.setAttribute("y", lyLabel);
+                textLabel.setAttribute("class", "svg-segment-label");
+                textLabel.textContent = `s${i}:${segVal}`;
+                svgSegmentArcs.appendChild(textLabel);
+
+                // 5. Draw outer mark coordinate labels (brightened labels)
+                const rMarkLabel = R_dial + 16;
+                const mx = Cx + rMarkLabel * Math.cos(startAngle);
+                const my = Cy + rMarkLabel * Math.sin(startAngle);
+
+                const markText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                markText.setAttribute("x", mx);
+                markText.setAttribute("y", my);
+                markText.setAttribute("class", "svg-mark-label");
+                markText.setAttribute("id", `svg-mark-label-${startVal}`);
+                markText.textContent = startVal;
+                svgMarkLabels.appendChild(markText);
+            }
+        }
+
+        // Draw overlay highlighting path from start index to end index (indices 0..k-1)
+        function drawHighlightOverlay(startSegIdx, endSegIdx) {
+            const Cx = 200;
+            const Cy = 200;
+            const R_dial = 130;
+
+            // Determine cumulative positions
+            let acc = 0;
+            const marks = [0];
+            for (let i = 0; i < currentK; i++) {
+                acc += currentRuler[i];
+                marks.push(acc);
+            }
+
+            const startMarkVal = marks[startSegIdx];
+            const endMarkVal = marks[(endSegIdx + 1) % (currentK + 1)] || currentL;
+
+            // For cyclic wrap-around calculation
+            let dist = 0;
+            let idx = startSegIdx;
+            while (true) {
+                dist += currentRuler[idx];
+                if (idx === endSegIdx) break;
+                idx = (idx + 1) % currentK;
+            }
+
+            const startAngle = (2 * Math.PI * startMarkVal) / currentL - Math.PI / 2;
+            const endAngle = (2 * Math.PI * (startMarkVal + dist)) / currentL - Math.PI / 2;
+
+            const xStart = Cx + R_dial * Math.cos(startAngle);
+            const yStart = Cy + R_dial * Math.sin(startAngle);
+            const xEnd = Cx + R_dial * Math.cos(endAngle);
+            const yEnd = Cy + R_dial * Math.sin(endAngle);
+
+            let d = "";
+            if (dist === currentL) {
+                d = `M ${Cx} ${Cy - R_dial} A ${R_dial} ${R_dial} 0 1 1 ${Cx} ${Cy + R_dial} A ${R_dial} ${R_dial} 0 1 1 ${Cx} ${Cy - R_dial}`;
+            } else {
+                const largeArc = (dist > currentL / 2) ? 1 : 0;
+                d = `M ${xStart} ${yStart} A ${R_dial} ${R_dial} 0 ${largeArc} 1 ${xEnd} ${yEnd}`;
+            }
+
+            svgHighlightOverlay.setAttribute("d", d);
+            svgHighlightOverlay.classList.add('active');
+
+            // Highlight starting tick and ending tick marks on the dial
+            const startTick = document.getElementById(`svg-tick-mark-${startMarkVal}`);
+            const endTick = document.getElementById(`svg-tick-mark-${(startMarkVal + dist) % currentL}`);
+            if (startTick) startTick.classList.add('highlighted');
+            if (endTick) endTick.classList.add('highlighted');
+
+            // Coordinate text highlights
+            const startLabel = document.getElementById(`svg-mark-label-${startMarkVal}`);
+            const endLabel = document.getElementById(`svg-mark-label-${(startMarkVal + dist) % currentL}`);
+            if (startLabel) startLabel.classList.add('highlighted');
+            if (endLabel) endLabel.classList.add('highlighted');
+        }
+
+        function clearHighlightOverlay() {
+            svgHighlightOverlay.classList.remove('active');
+
+            const ticks = document.querySelectorAll('.svg-tick-mark');
+            ticks.forEach(t => t.classList.remove('highlighted'));
+
+            const labels = document.querySelectorAll('.svg-mark-label');
+            labels.forEach(l => l.classList.remove('highlighted'));
+        }
+
+        // Render achieved lengths grid cells (1 .. L)
+        function renderLengthsGrid() {
+            lengthsContainer.innerHTML = '';
+
+            for (let d = 1; d <= currentL; d++) {
+                const pill = document.createElement('div');
+                const isAchieved = achievedDistances.has(d);
+
+                pill.className = `length-pill ${isAchieved ? 'achieved' : 'missing'}`;
+                pill.textContent = `${isAchieved ? '✓' : '✗'} ${d}`;
+                pill.setAttribute('id', `length-pill-${d}`);
+
+                if (isAchieved) {
+                    const paths = distancePathsMap.get(d) || [];
+                    let tooltipMsg = `Length ${d} achieved by ${paths.length} sequence(s):\n`;
+                    paths.forEach(p => {
+                        tooltipMsg += ` - s${p.start + 1} (+ ${p.count} segments)\n`;
+                    });
+                    pill.setAttribute('title', tooltipMsg);
+
+                    pill.addEventListener('mouseenter', () => {
+                        if (paths.length > 0) {
+                            highlightGridPaths(paths);
+                            setTerminalMessage(`$ Length ${d} achieved by: ` + paths.map(p => `s${p.start + 1}..s${((p.start + p.count - 1) % currentK) + 1}`).join(' OR '));
+                        }
+                    });
+
+                    pill.addEventListener('mouseleave', () => {
+                        clearTableHighlights();
+                        setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+                    });
+
+                } else {
+                    pill.setAttribute('title', `Length ${d} is NOT measurable by any contiguous segments.`);
+
+                    pill.addEventListener('mouseenter', () => {
+                        setTerminalMessage(`$ UNMEASURABLE: Length ${d} cannot be formed by this ruler.`);
+                    });
+                    pill.addEventListener('mouseleave', () => {
+                        setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+                    });
+                }
+
+                lengthsContainer.appendChild(pill);
+            }
+        }
+
+        // Highlight cells corresponding to a set of paths in the revamped table
+        function highlightGridPaths(paths) {
+            clearTableHighlights();
+            paths.forEach(p => {
+                const cell = document.getElementById(`cell-${p.start}-${p.count}`);
+                if (cell) cell.classList.add('cell-highlight');
+
+                const endIdx = (p.start + p.count - 1) % currentK;
+                drawHighlightOverlay(p.start, endIdx);
+            });
+        }
+
+        // Highlight corresponding starting row and column segment count headers when hovering SVG
+        function highlightMatrixPath(startIdx, count) {
+            clearTableHighlights();
+
+            const cell = document.getElementById(`cell-${startIdx}-${count}`);
+            if (cell) cell.classList.add('cell-highlight');
+
+            const rowHeader = document.getElementById(`row-header-${startIdx}`);
+            const colHeader = document.getElementById(`col-header-${count}`);
+            if (rowHeader) rowHeader.classList.add('row-highlight');
+            if (colHeader) colHeader.classList.add('col-highlight');
+
+            const endIdx = (startIdx + count - 1) % currentK;
+            drawHighlightOverlay(startIdx, endIdx);
+        }
+
+        // Clear all highlighted styles across elements
+        function clearTableHighlights() {
+            const cells = document.querySelectorAll('table.ruler-table td');
+            cells.forEach(c => c.classList.remove('cell-highlight'));
+
+            const headers = document.querySelectorAll('table.ruler-table th');
+            headers.forEach(h => {
+                h.classList.remove('col-highlight');
+                h.classList.remove('row-highlight');
+            });
+
+            const pills = document.querySelectorAll('.length-pill');
+            pills.forEach(p => p.classList.remove('active-highlight'));
+
+            clearHighlightOverlay();
+        }
+
+        // Render revamped transition table
+        // Rows = Starting segments s_1..s_k (first column)
+        // Columns = Number of segments 1..k-1 (across the top)
+        function renderMatrixTable() {
+            matrixHeaderRow.innerHTML = '<th class="corner">Start \\ Count</th>';
+            matrixBody.innerHTML = '';
+
+            // 1. Calculate occurrence counts for repeat coloring (only for columns 1 to k-1)
+            const countMap = new Map();
+            for (let i = 0; i < currentK; i++) {
+                for (let j = 1; j < currentK; j++) {
+                    const dist = getLengthBetweenSegments(currentRuler, i, j);
+                    countMap.set(dist, (countMap.get(dist) || 0) + 1);
+                }
+            }
+
+            // Pre-assign colors
+            const repeatColorsPalette = [
+                '#f08080', '#bae6fd', '#d8b4fe', '#fef08a',
+                '#fed7aa', '#99f6e4', '#e9d5ff', '#fdba74',
+                '#fecdd3', '#a5f3fc', '#d9f99d', '#fde047'
+            ];
+
+            const repeatColorMap = new Map();
+            let colorIdx = 0;
+            countMap.forEach((count, dist) => {
+                if (count > 1) {
+                    let col = "";
+                    if (colorIdx < repeatColorsPalette.length) {
+                        col = repeatColorsPalette[colorIdx];
+                    } else {
+                        col = `hsl(${(colorIdx * 137.5) % 360}, 80%, 75%)`;
+                    }
+                    repeatColorMap.set(dist, col);
+                    colorIdx++;
+                }
+            });
+
+            // 2. Build Column headers for count = 1 to k-1
+            for (let j = 1; j < currentK; j++) {
+                const th = document.createElement('th');
+                th.id = `col-header-${j}`;
+                th.innerHTML = `${j}<span class="cell-subtext">${j === 1 ? 'seg' : 'segs'}</span>`;
+                matrixHeaderRow.appendChild(th);
+            }
+
+            // 3. Build rows for each starting segment s_i (i from 0 to k-1)
+            for (let i = 0; i < currentK; i++) {
+                const tr = document.createElement('tr');
+
+                // Row header (first column)
+                const thRow = document.createElement('th');
+                thRow.id = `row-header-${i}`;
+                thRow.innerHTML = `s${i}<span class="cell-subtext">(${currentRuler[i]})</span>`;
+                tr.appendChild(thRow);
+
+                // Row cells (columns representing count = 1..k-1)
+                for (let j = 1; j < currentK; j++) {
+                    const td = document.createElement('td');
+                    td.id = `cell-${i}-${j}`;
+
+                    const dist = getLengthBetweenSegments(currentRuler, i, j);
+                    const endIdx = (i + j - 1) % currentK;
+
+                    td.innerHTML = `${dist}<span class="cell-subtext">s${i}→s${endIdx}</span>`;
+
+                    // Apply unique/repeat styling
+                    const count = countMap.get(dist);
+                    if (count === 1) {
+                        td.classList.add('cell-unique');
+                    } else if (count > 1) {
+                        const customColor = repeatColorMap.get(dist);
+                        td.style.backgroundColor = customColor;
+                        td.style.color = '#111111';
+                    }
+
+                    // Hover behavior
+                    td.addEventListener('mouseenter', () => {
+                        td.classList.add('cell-highlight');
+                        document.getElementById(`col-header-${j}`).classList.add('col-highlight');
+                        document.getElementById(`row-header-${i}`).classList.add('row-highlight');
+
+                        // Highlight SVG arc
+                        drawHighlightOverlay(i, endIdx);
+
+                        // Highlight Grid Pill
+                        const pill = document.getElementById(`length-pill-${dist}`);
+                        if (pill) pill.classList.add('active-highlight');
+
+                        setTerminalMessage(`$ Distance from s${i} covering ${j} segment(s) is ${dist} units.`);
+                    });
+
+                    td.addEventListener('mouseleave', () => {
+                        clearTableHighlights();
+                        setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+                    });
+
+                    tr.appendChild(td);
+                }
+
+                matrixBody.appendChild(tr);
+            }
+        }
+
+        // Generate unique neighbor rulers from modifications
+        function getUniqueNeighbors(ruler) {
+            const k = ruler.length;
+            if (k === 0) return [];
+
+            const neighborsMap = new Map(); // canonicalStr -> { ruler, mods: [] }
+
+            function addNeighbor(neighborRuler, modText) {
+                if (neighborRuler.length === 0) return;
+                const canon = getCanonical(neighborRuler);
+                const canonStr = JSON.stringify(canon);
+
+                // Do not include the current ruler as a neighbor node
+                if (JSON.stringify(getCanonical(ruler)) === canonStr) return;
+
+                if (!neighborsMap.has(canonStr)) {
+                    neighborsMap.set(canonStr, {
+                        ruler: canon,
+                        mods: [modText]
+                    });
+                } else {
+                    const entry = neighborsMap.get(canonStr);
+                    if (!entry.mods.includes(modText)) {
+                        entry.mods.push(modText);
+                    }
+                }
+            }
+
+            // 1. Subtract 1 from any segment
+            for (let i = 0; i < k; i++) {
+                if (ruler[i] > 1) {
+                    const copy = [...ruler];
+                    copy[i] -= 1;
+                    addNeighbor(copy, `Subtract 1 from s${i}`);
+                }
+            }
+
+            // 2. Add 1 to any segment
+            for (let i = 0; i < k; i++) {
+                const copy = [...ruler];
+                copy[i] += 1;
+                addNeighbor(copy, `Add 1 to s${i}`);
+            }
+
+            // 3. Combine neighboring segments, optionally subtracting 1
+            if (k >= 2) {
+                for (let i = 0; i < k; i++) {
+                    // Combine
+                    const copyCombine = [];
+                    for (let j = 0; j < k; j++) {
+                        if (j === i) {
+                            copyCombine.push(ruler[i] + ruler[(i + 1) % k]);
+                        } else if (j === (i + 1) % k) {
+                            // skip
+                        } else {
+                            copyCombine.push(ruler[j]);
+                        }
+                    }
+                    addNeighbor(copyCombine, `Combine s${i} and s${(i + 1) % k}`);
+
+                    // Combine and subtract 1
+                    if (ruler[i] + ruler[(i + 1) % k] > 2) {
+                        const copyCombineSub = [];
+                        for (let j = 0; j < k; j++) {
+                            if (j === i) {
+                                copyCombineSub.push(ruler[i] + ruler[(i + 1) % k] - 1);
+                            } else if (j === (i + 1) % k) {
+                                // skip
+                            } else {
+                                copyCombineSub.push(ruler[j]);
+                            }
+                        }
+                        addNeighbor(copyCombineSub, `Combine s${i} and s${(i + 1) % k} and subtract 1`);
+                    }
+                }
+            }
+
+            // 4. Split segment, optionally add 1 to one of the new segments
+            for (let i = 0; i < k; i++) {
+                const val = ruler[i];
+                // Split S (only if S >= 2)
+                for (let a = 1; a < val; a++) {
+                    const b = val - a;
+                    const copySplit = [];
+                    for (let j = 0; j < k; j++) {
+                        if (j === i) {
+                            copySplit.push(a, b);
+                        } else {
+                            copySplit.push(ruler[j]);
+                        }
+                    }
+                    addNeighbor(copySplit, `Split s${i} into ${a} and ${b}`);
+                }
+
+                // Split S and add 1 (adds 1 to one of them, sum is S + 1)
+                for (let a = 1; a <= val; a++) {
+                    const b = val + 1 - a;
+                    const copySplitAdd = [];
+                    for (let j = 0; j < k; j++) {
+                        if (j === i) {
+                            copySplitAdd.push(a, b);
+                        } else {
+                            copySplitAdd.push(ruler[j]);
+                        }
+                    }
+                    addNeighbor(copySplitAdd, `Split s${i} into ${a} and ${b} (adds 1)`);
+                }
+            }
+
+            return Array.from(neighborsMap.values());
+        }
+
+        // Helper to check if a sibling/neighbor ruler is complete
+        function isRulerComplete(ruler) {
+            const k = ruler.length;
+            const L = ruler.reduce((a, b) => a + b, 0);
+            if (L <= 1) return false;
+
+            const achieved = new Set();
+            for (let startIdx = 0; startIdx < k; startIdx++) {
+                for (let count = 1; count <= k; count++) {
+                    let sum = 0;
+                    for (let m = 0; m < count; m++) {
+                        sum += ruler[(startIdx + m) % k];
+                    }
+                    achieved.add(sum);
+                }
+            }
+
+            for (let d = 1; d < L; d++) {
+                if (!achieved.has(d)) return false;
+            }
+            return true;
+        }
+
+        // Render Ruler exploration network graph using radial coordinate system
+        function renderExplorationGraph() {
+            const svgNodes = document.getElementById('graph-nodes');
+            const svgLinks = document.getElementById('graph-links');
+
+            svgNodes.innerHTML = '';
+            svgLinks.innerHTML = '';
+
+            const Cx = 400;
+            const Cy = 230;
+
+            // Only show neighbors that are COMPLETE
+            const neighbors = getUniqueNeighbors(currentRuler).filter(nb => isRulerComplete(nb.ruler));
+
+            const centerText = `[${currentRuler.join(',')}] L=${currentL}`;
+            const centerWidth = Math.max(140, centerText.length * 8.5);
+            const centerHeight = 32;
+
+            const outerRadius = 180;
+            const innerRadius = 110;
+            const totalNb = neighbors.length;
+
+            neighbors.forEach((nb, idx) => {
+                let radius = outerRadius;
+                // Double concentric rings layout to prevent overlapping on long segment lists
+                if (totalNb > 14) {
+                    radius = (idx % 2 === 0) ? outerRadius : innerRadius;
+                }
+
+                const angle = (2 * Math.PI * idx) / totalNb - Math.PI / 2;
+                const nx = Cx + radius * Math.cos(angle);
+                const ny = Cy + radius * Math.sin(angle);
+
+                const nbL = nb.ruler.reduce((sum, v) => sum + v, 0);
+                const nbK = nb.ruler.length;
+                
+                // Determine if neighbor is minimal
+                let isMinimal = false;
+                if (nbL <= 100) {
+                    const minK = MINIMAL_SEGMENTS_UP_TO_100[nbL];
+                    isMinimal = (nbK === minK);
+                } else {
+                    const lb = Math.ceil((Math.sqrt(4 * nbL - 3) + 1) / 2);
+                    isMinimal = (nbK === lb);
+                }
+
+                const nodeText = `[${nb.ruler.join(',')}] L=${nbL}`;
+                const nodeWidth = Math.max(105, nodeText.length * 7.5);
+                const nodeHeight = 26;
+
+                // Draw link line
+                const link = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                link.setAttribute("x1", Cx);
+                link.setAttribute("y1", Cy);
+                link.setAttribute("x2", nx);
+                link.setAttribute("y2", ny);
+                link.setAttribute("class", "graph-link");
+                link.setAttribute("id", `graph-link-${idx}`);
+                svgLinks.appendChild(link);
+
+                // Parent group for translate positioning
+                const parentG = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                parentG.setAttribute("transform", `translate(${nx}, ${ny})`);
+
+                // Child group for hover interaction scaling
+                const childG = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                childG.setAttribute("class", "graph-node-group");
+
+                const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+                rect.setAttribute("x", -nodeWidth / 2);
+                rect.setAttribute("y", -nodeHeight / 2);
+                rect.setAttribute("width", nodeWidth);
+                rect.setAttribute("height", nodeHeight);
+                rect.setAttribute("rx", 4);
+                // Class name determines coloring: complete-minimal (green) or complete-not-minimal (blue)
+                rect.setAttribute("class", `graph-node-rect ${isMinimal ? 'complete-minimal' : 'complete-not-minimal'}`);
+
+                const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                text.setAttribute("class", "graph-node-text");
+                text.textContent = nodeText;
+
+                childG.appendChild(rect);
+                childG.appendChild(text);
+                parentG.appendChild(childG);
+
+                // Attach triggers to childG group to link rect and text scaling/hovering in sync
+                childG.addEventListener('mouseenter', () => {
+                    link.classList.add('highlighted');
+                    setTerminalMessage(`$ Neighbor: [${nb.ruler.join(', ')}] (L=${nbL}, k=${nbK}, Complete: Yes, Minimal: ${isMinimal ? 'Yes' : 'No'}) via: ${nb.mods.join(' OR ')}`);
+                });
+
+                childG.addEventListener('mouseleave', () => {
+                    link.classList.remove('highlighted');
+                    setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+                });
+
+                childG.addEventListener('click', () => {
+                    rulerInput.value = nb.ruler.join(', ');
+                    analyzeCurrentRuler();
+                });
+
+                svgNodes.appendChild(parentG);
+            });
+
+            // Draw center node on top
+            const centerParentG = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            centerParentG.setAttribute("transform", `translate(${Cx}, ${Cy})`);
+
+            const centerChildG = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            centerChildG.setAttribute("class", "graph-node-group");
+
+            const centerRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+            centerRect.setAttribute("x", -centerWidth / 2);
+            centerRect.setAttribute("y", -centerHeight / 2);
+            centerRect.setAttribute("width", centerWidth);
+            centerRect.setAttribute("height", centerHeight);
+            centerRect.setAttribute("rx", 6);
+            centerRect.setAttribute("class", "graph-node-rect current");
+
+            const centerTextElem = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            centerTextElem.setAttribute("class", "graph-node-text current");
+            centerTextElem.textContent = centerText;
+
+            centerChildG.appendChild(centerRect);
+            centerChildG.appendChild(centerTextElem);
+            centerParentG.appendChild(centerChildG);
+
+            centerChildG.addEventListener('mouseenter', () => {
+                setTerminalMessage(`$ CURRENT RULER: [${currentRuler.join(', ')}] (L=${currentL}, k=${currentK})`);
+            });
+
+            centerChildG.addEventListener('mouseleave', () => {
+                setTerminalMessage(`$ Idle. Hover cell, segment or graph node to inspect.`);
+            });
+
+            svgNodes.appendChild(centerParentG);
+        }
+
+        // Canonicalize current ruler input and trigger analyze
+        function canonicalizeInput() {
+            errorAlert.style.display = 'none';
+            try {
+                const parsed = parseRulerInput(rulerInput.value);
+                const canonical = getCanonical(parsed);
+                rulerInput.value = canonical.join(', ');
+                analyzeCurrentRuler();
+                setTerminalMessage(`$ Ruler successfully canonicalized to [${canonical.join(', ')}].`);
+            } catch (err) {
+                showError(err.message);
+                setTerminalMessage(`$ ERROR: Failed to canonicalize. ${err.message}`);
+            }
+        }
+
+        // Generate ASCII table for plain text email
+        function generateASCIITable(ruler) {
+            const n = ruler.length;
+            if (n === 0) return '';
+
+            let result = '';
+            let headerRow = padString('Start \\ Count', 16);
+            for (let i = 1; i < n; i++) {
+                headerRow += padString(i.toString(), 9);
+            }
+            result += headerRow + '\n';
+
+            let separator = '-'.repeat(16 + (n - 1) * 9);
+            result += separator + '\n';
+
+            for (let i = 0; i < n; i++) {
+                let rowStr = padString(`s${i} (${ruler[i]})`, 16);
+                for (let j = 1; j < n; j++) {
+                    const length = getLengthBetweenSegments(ruler, i, j);
+                    rowStr += padString(length.toString(), 9);
+                }
+                result += rowStr + '\n';
+            }
+
+            return result;
+        }
+
+        function padString(str, len) {
+            if (str.length >= len) return str;
+            return str + ' '.repeat(len - str.length);
+        }
+
+        // Draft pre-populated email to Mitchell Haugen (opens in a new tab)
+        function shareRulerByEmail() {
+            const isComplete = checkCompleteness();
+
+            let minimalityText = "No";
+            if (isComplete) {
+                if (currentL <= 100) {
+                    const minK = MINIMAL_SEGMENTS_UP_TO_100[currentL];
+                    minimalityText = (currentK === minK) ? "Yes" : "No";
+                } else {
+                    const lb = Math.ceil((Math.sqrt(4 * currentL - 3) + 1) / 2);
+                    const ub = Math.floor(Math.sqrt(2 * currentL));
+                    if (currentK === lb) minimalityText = "Yes";
+                    else if (currentK > ub) minimalityText = "No";
+                    else minimalityText = "Maybe";
+                }
+            }
+
+            const subject = `Sparse Circular Ruler Log: [${currentRuler.join(',')}] (L=${currentL}, k=${currentK})`;
+
+            let body = `Hi Mitchell,\n\n`;
+            body += `Here is a circular sparse ruler analysis from the web visualizer:\n\n`;
+            body += `------------------------------------------------------------\n`;
+            body += `RULER SEGMENTS:   [${currentRuler.join(', ')}]\n`;
+            body += `TOTAL LENGTH (L): ${currentL}\n`;
+            body += `SEGMENTS COUNT(k):${currentK}\n`;
+            body += `IS COMPLETE:      ${isComplete ? 'Yes' : 'No'}\n`;
+            body += `IS MINIMAL:       ${minimalityText}\n`;
+            body += `------------------------------------------------------------\n\n`;
+
+            body += `SEGMENT DISTANCE TRANSITION MATRIX:\n`;
+            body += generateASCIITable(currentRuler);
+            body += `\n`;
+            body += `Shared from the Sparse Circular Ruler Visualizer.\n`;
+
+            const mailtoUrl = `mailto:rulers@mitchellhaugen.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+            window.open(mailtoUrl, '_blank');
+        }
+
+        // Fetch version from Cargo.toml dynamically
+        function loadVersion() {
+            // Try fetching from parent directory
+            fetch('../Cargo.toml')
+                .then(res => {
+                    if (!res.ok) throw new Error();
+                    return res.text();
+                })
+                .then(text => parseCargoToml(text))
+                .catch(() => {
+                    // Try fetching from root (in case served at root)
+                    fetch('/Cargo.toml')
+                        .then(res => {
+                            if (!res.ok) throw new Error();
+                            return res.text();
+                        })
+                        .then(text => parseCargoToml(text))
+                        .catch(() => {
+                            // Leave default v0.9.3 in HTML if both fail
+                        });
+                });
+        }
+
+        function parseCargoToml(text) {
+            const packageSection = text.split(/\[\w+\]/).find(s => s.includes('name =') || s.includes('version ='));
+            if (packageSection) {
+                const match = packageSection.match(/version\s*=\s*"([^"]+)"/);
+                if (match) {
+                    document.getElementById('tool-version').textContent = `v${match[1]}`;
+                }
+            }
+        }
+
+        // Attach event listeners
+        btnAnalyze.addEventListener('click', analyzeCurrentRuler);
+        btnCanonicalize.addEventListener('click', canonicalizeInput);
+        btnShare.addEventListener('click', shareRulerByEmail);
+
+        rulerInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                analyzeCurrentRuler();
+            }
+        });
+
+        // Initial setup on load
+        window.addEventListener('load', () => {
+            loadPresets();
+            loadVersion();
+            analyzeCurrentRuler();
+        });
+    </script>
+</body>
+
+</html>
