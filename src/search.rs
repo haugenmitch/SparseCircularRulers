@@ -590,6 +590,23 @@ mod tests {
         }
     }
 
+    /// The widest bitsets find a complete ruler of the longest supported length, whose
+    /// marks and distances reach the top bits: 15 segments of 1, then 15 of 16 (L = 255).
+    #[test]
+    fn finds_ruler_of_length_255() {
+        let ruler: Vec<u8> = [vec![1; 15], vec![16; 15]].concat();
+        let s = <Search>::new(255, 30);
+        let mut marks = vec![0u8];
+        for &seg in &ruler[..29] {
+            marks.push(marks.last().unwrap() + seg);
+        }
+        let interrupt = AtomicBool::new(true);
+        let counter = AtomicU64::new(0);
+        let mut dfs = Dfs::new(&s, &interrupt, &counter);
+        dfs.run(&s.node_from_marks(&marks[..26]));
+        assert!(dfs.found.contains(&ruler));
+    }
+
     #[test]
     fn matches_brute_force() {
         // Covers the minimal segment count and the one above it (which has many more
