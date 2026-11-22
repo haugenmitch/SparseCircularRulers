@@ -205,10 +205,12 @@ impl GpuContext {
                 let source = include_str!("shader.wgsl")
                     .replace("__WORDS__", &words.to_string())
                     .replace("__HWORDS__", &half_words.to_string());
-                let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("Sparse Ruler Shader"),
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                });
+                let shader = self
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Sparse Ruler Shader"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    });
                 self.device
                     .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some("Sparse Ruler Compute Pipeline"),
@@ -344,8 +346,16 @@ impl GpuContext {
         }
         self.queue.submit(Some(encoder.finish()));
         let mut data = self.read(&reads)?.into_iter();
-        let finished = if finished > 0 { data.next().unwrap() } else { Vec::new() };
-        let rulers = if found > 0 { data.next().unwrap() } else { Vec::new() };
+        let finished = if finished > 0 {
+            data.next().unwrap()
+        } else {
+            Vec::new()
+        };
+        let rulers = if found > 0 {
+            data.next().unwrap()
+        } else {
+            Vec::new()
+        };
         Ok(Pass {
             rulers,
             finished,

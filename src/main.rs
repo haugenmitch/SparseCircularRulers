@@ -926,14 +926,21 @@ impl State {
         let header = to_json(self);
         self.solutions = solutions;
         const EMPTY: &[u8] = b"\"solutions\": {}";
-        let at = header.windows(EMPTY.len()).rposition(|w| w == EMPTY).unwrap() + EMPTY.len() - 1;
+        let at = header
+            .windows(EMPTY.len())
+            .rposition(|w| w == EMPTY)
+            .unwrap()
+            + EMPTY.len()
+            - 1;
         let mut pieces = vec![Arc::new(header[..at].to_vec())];
 
         let mut lengths: Vec<u8> = self.solutions.keys().copied().collect();
         lengths.sort();
         for (i, length) in lengths.into_iter().enumerate() {
             let comma = if i > 0 { "," } else { "" };
-            pieces.push(Arc::new(format!("{comma}\n    \"{length}\": ").into_bytes()));
+            pieces.push(Arc::new(
+                format!("{comma}\n    \"{length}\": ").into_bytes(),
+            ));
             let solution = &self.solutions[&length];
             match current {
                 _ if solution.completed => pieces.push(
@@ -948,7 +955,10 @@ impl State {
                 {
                     let json = indent(to_json(solution));
                     const RULERS: &[u8] = b"\"rulers\": []";
-                    let at = json.windows(RULERS.len()).position(|w| w == RULERS).unwrap()
+                    let at = json
+                        .windows(RULERS.len())
+                        .position(|w| w == RULERS)
+                        .unwrap()
                         + RULERS.len()
                         - 1;
                     pieces.push(Arc::new(json[..at].to_vec()));
@@ -992,7 +1002,11 @@ impl SaveCache {
         }
         let mut json = Vec::new();
         for (i, ruler) in rulers.iter().enumerate().skip(*done) {
-            json.extend_from_slice(if i > 0 { b",\n        [" } else { b"\n        [" });
+            json.extend_from_slice(if i > 0 {
+                b",\n        ["
+            } else {
+                b"\n        ["
+            });
             for (j, s) in ruler.iter().enumerate() {
                 if j > 0 {
                     json.extend_from_slice(b", ");

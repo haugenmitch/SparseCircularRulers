@@ -392,7 +392,11 @@ pub struct Dfs<'a, const W: usize, const H: usize> {
 }
 
 impl<'a, const W: usize, const H: usize> Dfs<'a, W, H> {
-    pub fn new(search: &'a Search<W, H>, interrupt: &'a AtomicBool, eval_counter: &'a AtomicU64) -> Self {
+    pub fn new(
+        search: &'a Search<W, H>,
+        interrupt: &'a AtomicBool,
+        eval_counter: &'a AtomicU64,
+    ) -> Self {
         Dfs {
             search,
             interrupt,
@@ -529,7 +533,11 @@ mod tests {
         out
     }
 
-    fn search_all<const W: usize, const H: usize>(length: u8, n: u8, target: usize) -> Vec<Vec<u8>> {
+    fn search_all<const W: usize, const H: usize>(
+        length: u8,
+        n: u8,
+        target: usize,
+    ) -> Vec<Vec<u8>> {
         let s = Search::<W, H>::new(length, n);
         let interrupt = AtomicBool::new(true);
         let counter = AtomicU64::new(0);
@@ -591,9 +599,21 @@ mod tests {
             let lb = crate::get_num_segments_lower_bound(length).max(2);
             for n in lb..=(lb + 1).min(length) {
                 let expected = brute_force(length, n);
-                assert_eq!(search_all::<1, 1>(length, n, 1), expected, "L={length} n={n}");
-                assert_eq!(search_all::<1, 1>(length, n, 50), expected, "L={length} n={n}");
-                assert_eq!(search_all::<4, 2>(length, n, 50), expected, "L={length} n={n}");
+                assert_eq!(
+                    search_all::<1, 1>(length, n, 1),
+                    expected,
+                    "L={length} n={n}"
+                );
+                assert_eq!(
+                    search_all::<1, 1>(length, n, 50),
+                    expected,
+                    "L={length} n={n}"
+                );
+                assert_eq!(
+                    search_all::<4, 2>(length, n, 50),
+                    expected,
+                    "L={length} n={n}"
+                );
             }
         }
     }
