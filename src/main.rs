@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 mod gpu;
 mod search;
 use gpu::{GpuContext, SearchParams};
-use search::{Dfs, Search};
+use search::{Dfs, MAX_MARKS, Search};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -152,6 +152,8 @@ enum SearchStatus {
     Finished,
     Interrupted,
     GpuFailed,
+    /// The segment count is outside what the search supports (2 to `MAX_MARKS`).
+    Unsupported,
 }
 
 struct SearchProgress {
@@ -257,6 +259,9 @@ impl State {
             solution.total_rulers_evaluated = 1;
             self.recalculate_global_metrics();
             return SearchStatus::Finished;
+        }
+        if ctx.length < 2 || !(2..=MAX_MARKS).contains(&(ctx.num_segments as usize)) {
+            return SearchStatus::Unsupported;
         }
 
         let (checkpoint, saved_finished, start_evaluated, mut found_rulers) =
@@ -1287,13 +1292,18 @@ fn execute(
                     }
                     num_segments += 1;
                 }
-                SearchStatus::Interrupted | SearchStatus::GpuFailed => {
+                SearchStatus::Interrupted | SearchStatus::GpuFailed | SearchStatus::Unsupported => {
                     progress.status_pb.finish_and_clear();
                     progress.progress_pb.finish_and_clear();
                     progress.stats_pb.finish_and_clear();
-                    let failed = status == SearchStatus::GpuFailed;
-                    if failed {
+                    let failed = status != SearchStatus::Interrupted;
+                    if status == SearchStatus::GpuFailed {
                         eprintln!("\nGPU search failed, saving and exiting...");
+                    } else if failed {
+                        eprintln!(
+                            "\nError: cannot search length {i} with {num_segments} segments \
+                             (the search supports 2 to {MAX_MARKS}), saving and exiting..."
+                        );
                     } else if !quiet {
                         println!("\nReceived interrupt, saving and exiting...");
                     }
@@ -1405,11 +1415,16 @@ fn main() {
         cli.start
     } else {
         // If not specified, start from the first uncompleted length
-        let mut i = 1;
-        while state.solutions.get(&i).is_some_and(|s| s.completed) {
-            i += 1;
-        }
-        i
+        let first = (1..=u8::MAX).find(|i| !state.solutions.get(i).is_some_and(|s| s.completed));
+        first.unwrap_or_else(|| {
+            if !cli.quiet {
+                println!("Every length up to {} is already solved.", u8::MAX);
+            }
+            if cli.json {
+                let _ = print_state(&state);
+            }
+            std::process::exit(0);
+        })
     };
 
     execute(

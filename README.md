@@ -25,7 +25,7 @@ A Rust program to find minimal complete circular sparse rulers.
 - [x] Unit tests
 - [x] CUDA/threading using the GPU
 - [x] Re-add latest ruler found display to UI
-- [ ] Make sure the program is robust up to length 256
+- [x] Make sure the program is robust up to length 255
 - [x] "/s evals" -> "evals/s"
 - [x] Robust symmetry breaking (Circular/Reflection) to ensure unique rulers in output.
 - [x] Add an [ALGORITHM.md](ALGORITHM.md) file to describe the algorithms, efficiency gains, and tricks used in the calculations in this program
