@@ -44,8 +44,9 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline_layout: wgpu::PipelineLayout,
-    /// One pipeline per bitset size (`SearchParams::words`), built on first use.
-    pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    /// One pipeline per bitset size (`SearchParams::words`, and the words that hold distances
+    /// up to half the length), built on first use.
+    pipelines: Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>,
     bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
     work_buffer: wgpu::Buffer,
@@ -196,12 +197,14 @@ impl GpuContext {
         })
     }
 
-    fn pipeline(&self, words: u32) -> wgpu::ComputePipeline {
+    fn pipeline(&self, words: u32, half_words: u32) -> wgpu::ComputePipeline {
         let mut pipelines = self.pipelines.lock().unwrap();
         pipelines
-            .entry(words)
+            .entry((words, half_words))
             .or_insert_with(|| {
-                let source = include_str!("shader.wgsl").replace("__WORDS__", &words.to_string());
+                let source = include_str!("shader.wgsl")
+                    .replace("__WORDS__", &words.to_string())
+                    .replace("__HWORDS__", &half_words.to_string());
                 let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Sparse Ruler Shader"),
                     source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -297,7 +300,7 @@ impl GpuContext {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline(params.words));
+            pass.set_pipeline(&self.pipeline(params.words, params.length / 2 / 32 + 1));
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(params.num_work.div_ceil(WORKGROUP_SIZE), 1, 1);
         }

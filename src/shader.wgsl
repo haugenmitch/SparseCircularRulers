@@ -1,9 +1,12 @@
 // Backtracking search for complete circular rulers; each thread searches one partial ruler,
 // in steps of at most node_budget nodes per pass.
-// This mirrors `Dfs::run` in search.rs: see there for the pruning rules.
+// This mirrors `Dfs::run` in search.rs (see there for the pruning rules), except that the
+// rotation and reflection rules are only applied to the partial rulers handed to the GPU:
+// checking them here needs per-depth state indexed by each thread's own depth, which cost
+// more GPU time than the nodes they cut saved.
 //
-// WORDS (32-bit words per bitset) is substituted when the pipeline is built, so every
-// bitset loop has a constant bound and unrolls. Words are only ever indexed by constants
+// WORDS (32-bit words per bitset) and HWORDS are substituted when the pipeline is built, so
+// every bitset loop has a constant bound and unrolls. Words are only ever indexed by constants
 // (`word` picks a runtime index with selects), which keeps the bitsets in registers.
 //
 // Some forms crash the radv (Mesa 26) shader compiler and are avoided: early returns
@@ -11,6 +14,9 @@
 // a[max(i, 1u) - 1u], and short loops ending in `break` that the compiler unrolls.
 
 const WORDS: u32 = __WORDS__u;
+// Words that hold distances up to length / 2, the only ones tracked (measuring d also
+// measures length - d); covered distances are stored per depth in this many words.
+const HWORDS: u32 = __HWORDS__u;
 
 struct Params {
     length: u32,
@@ -42,6 +48,20 @@ const STATE_STRIDE: u32 = 66u;
 @group(0) @binding(6) var<storage, read_write> finished: array<u32>;
 
 alias Bits = array<u32, WORDS>;
+alias HBits = array<u32, HWORDS>;
+
+// The first HWORDS words of a.
+fn narrow(a: Bits) -> HBits {
+    var r: HBits;
+    for (var i = 0u; i < HWORDS; i++) { r[i] = a[i]; }
+    return r;
+}
+
+fn widen(a: HBits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < HWORDS; i++) { r[i] = a[i]; }
+    return r;
+}
 
 // Word j of a, or 0 if j is out of range.
 fn word(a: Bits, j: u32) -> u32 {
@@ -196,7 +216,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let l = params.length;
     let n = params.num_segments;
-    let full = bits_range(1u, l - 1u);
     let half = bits_range(1u, l / 2u);
     let slot = work[idx * 2u];
     let prefix = work[idx * 2u + 1u];
@@ -204,7 +223,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var pos: array<u32, 32>;
     var nextp: array<u32, 32>;
-    var covs: array<Bits, 32>;
+    // Covered distances at each depth (only those up to l / 2 count).
+    var covs: array<HBits, 32>;
     var marks: Bits;
     var rev: Bits;
     var k: u32;
@@ -230,7 +250,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (i > 0u) { cov = bits_or(cov, new_distances(marks, rev, p)); }
         marks = bits_toggle(marks, p);
         rev = bits_toggle(rev, l - 1u - p);
-        if (i + 1u >= d) { covs[i + 1u] = cov; }
+        if (i + 1u >= d) { covs[i + 1u] = narrow(cov); }
     }
 
     var nodes = 0u;
@@ -243,7 +263,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let lo = pos[k - 1u] + 1u;
             let hi = limit(k, pos[2]);
             if (lo <= hi) {
-                let missing = bits_and_not(full, covs[k]);
+                let missing = bits_and_not(half, widen(covs[k]));
                 var cand = bits_range(lo, hi);
                 let d0 = bits_lowest(missing);
                 if (d0 != 0xFFFFFFFFu) {
@@ -289,7 +309,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         } else {
             // Try positions p = nextp[k]..=limit; moving p by one shifts its new distances by one.
-            let ck = covs[k];
+            let ck = widen(covs[k]);
             let lim = limit(k, pos[2]);
             let k1 = k + 1u;
             let r = n - k1;
@@ -311,7 +331,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     pos[k] = p;
                     marks = bits_toggle(marks, p);
                     rev = bits_toggle(rev, l - 1u - p);
-                    covs[k1] = nc;
+                    covs[k1] = narrow(nc);
                     k = k1;
                     nextp[k] = p + 1u;
                     descended = true;
