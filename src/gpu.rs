@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -9,69 +9,61 @@ use wgpu::util::DeviceExt;
 pub struct SearchParams {
     pub length: u32,
     pub num_segments: u32,
-    pub batch_size: u32, // Number of threads
-    pub start_rank_low: u32,
-    pub start_rank_high: u32,
-    pub steps_per_thread: u32,
-    pub _padding: [u32; 2],
+    /// Number of (slot, prefix) entries in this pass (one GPU thread each).
+    pub num_work: u32,
+    /// Marks per partial ruler.
+    pub prefix_depth: u32,
+    /// 32-bit words per bitset.
+    pub words: u32,
+    pub max_results: u32,
+    /// Search nodes each thread may visit before it saves its state and stops for this pass.
+    pub node_budget: u32,
+    pub _padding: u32,
 }
 
-pub struct GpuConfig {
-    pub steps_per_thread: u32,
-    pub threads_per_batch: u32,
-}
+/// Marks the work entry of a slot that resumes its saved state instead of starting a prefix.
+pub const RESUME: u32 = u32::MAX;
 
-impl GpuConfig {
-    pub fn for_length(length: u32) -> Self {
-        if length < 70 {
-            // Small lengths: Low complexity, reduce launch overhead
-            Self {
-                steps_per_thread: 1024,
-                threads_per_batch: 131072,
-            }
-        } else if length < 110 {
-            // Medium lengths: Divergence starts, lower steps for better scheduling
-            Self {
-                steps_per_thread: 128,
-                threads_per_batch: 1048576,
-            }
-        } else {
-            // Large lengths: Maximize throughput with very large batches
-            Self {
-                steps_per_thread: 128,
-                threads_per_batch: 2097152,
-            }
-        }
-    }
-}
+const WORKGROUP_SIZE: u32 = 64;
+const MAX_MARKS: u64 = 32;
+/// u32s of saved search state per slot: depth, then 32 marks, then 32 next positions.
+const STATE_STRIDE: u64 = 1 + 2 * MAX_MARKS;
+/// Longest a pass may take before the GPU is considered lost.
+const PASS_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub struct GpuBuffers {
-    pub params_buffer: wgpu::Buffer,
-    pub results_buffer: wgpu::Buffer,
-    pub counter_buffer: wgpu::Buffer,
-    pub staging_results: wgpu::Buffer,
-    pub staging_counter: wgpu::Buffer,
-    pub bind_group: wgpu::BindGroup,
+/// What one pass returned.
+pub struct Pass {
+    /// Marks of the complete rulers found (`num_segments` per ruler).
+    pub rulers: Vec<u32>,
+    /// Slots whose partial ruler was fully searched.
+    pub finished: Vec<u32>,
+    pub nodes: u64,
 }
 
 pub struct GpuContext {
-    pub device: Arc<wgpu::Device>,
-    pub queue: Arc<wgpu::Queue>,
-    pub pipeline: wgpu::ComputePipeline,
-    pub bind_group_layout: wgpu::BindGroupLayout,
-    pub binomial_buffer: wgpu::Buffer,
-    pub buffer_pool: Mutex<VecDeque<GpuBuffers>>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline_layout: wgpu::PipelineLayout,
+    /// One pipeline per bitset size (`SearchParams::words`), built on first use.
+    pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    bind_group: wgpu::BindGroup,
+    params_buffer: wgpu::Buffer,
+    work_buffer: wgpu::Buffer,
+    prefix_buffer: wgpu::Buffer,
+    results_buffer: wgpu::Buffer,
+    counter_buffer: wgpu::Buffer,
+    finished_buffer: wgpu::Buffer,
+    staging_counter: wgpu::Buffer,
+    staging_finished: wgpu::Buffer,
+    staging_results: wgpu::Buffer,
+    /// Partial rulers searched at once; each keeps its search state in a slot between passes.
+    pub max_slots: u32,
+    /// Most rulers one pass can return.
     pub max_results: u32,
 }
 
-pub struct GpuSearchTask {
-    pub r_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    pub c_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    pub bufs: GpuBuffers,
-}
-
 impl GpuContext {
-    pub async fn new(max_results: u32) -> Option<Self> {
+    pub async fn new(max_slots: u32, max_results: u32) -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -98,286 +90,238 @@ impl GpuContext {
             .await
             .ok()?;
 
-        // Generate Binomial Table for n=0..255, k=0..32
-        // Stored as 256 rows of 33 u64 values
-        let mut table = Vec::new();
-        for n in 0..=255 {
-            for k in 0..=32 {
-                table.push(binomial_u64(n as u64, k as u64));
-            }
-        }
-
-        let binomial_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Binomial Buffer"),
-            contents: bytemuck::cast_slice(&table),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let shader_src = include_str!("shader.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Sparse Ruler Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
-
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage = |read_only| wgpu::BufferBindingType::Storage { read_only };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Sparse Ruler Bind Group Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                entry(0, wgpu::BufferBindingType::Uniform),
+                entry(1, storage(true)),
+                entry(2, storage(true)),
+                entry(3, storage(false)),
+                entry(4, storage(false)),
+                entry(5, storage(false)),
+                entry(6, storage(false)),
             ],
         });
-
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Sparse Ruler Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Sparse Ruler Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        let buffer = |label, size, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        use wgpu::BufferUsages as U;
+        let slots = max_slots as u64;
+        let results_size = max_results as u64 * MAX_MARKS * 4;
+        let params_buffer = buffer(
+            "Params",
+            std::mem::size_of::<SearchParams>() as u64,
+            U::UNIFORM | U::COPY_DST,
+        );
+        let work_buffer = buffer("Work", slots * 2 * 4, U::STORAGE | U::COPY_DST);
+        let prefix_buffer = buffer("Prefixes", slots * MAX_MARKS * 4, U::STORAGE | U::COPY_DST);
+        let results_buffer = buffer("Results", results_size, U::STORAGE | U::COPY_SRC);
+        let counter_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Counters"),
+            contents: bytemuck::cast_slice(&[0u32; 4]),
+            usage: U::STORAGE | U::COPY_SRC | U::COPY_DST,
+        });
+        let state_buffer = buffer("Search State", slots * STATE_STRIDE * 4, U::STORAGE);
+        let finished_buffer = buffer("Finished Slots", slots * 4, U::STORAGE | U::COPY_SRC);
+        let staging_counter = buffer("Staging Counters", 16, U::MAP_READ | U::COPY_DST);
+        let staging_finished = buffer("Staging Finished", slots * 4, U::MAP_READ | U::COPY_DST);
+        let staging_results = buffer("Staging Results", results_size, U::MAP_READ | U::COPY_DST);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Sparse Ruler Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                &params_buffer,
+                &work_buffer,
+                &prefix_buffer,
+                &results_buffer,
+                &counter_buffer,
+                &state_buffer,
+                &finished_buffer,
+            ]
+            .iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect::<Vec<_>>(),
         });
 
         Some(Self {
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            pipeline,
-            bind_group_layout,
-            binomial_buffer,
-            buffer_pool: Mutex::new(VecDeque::new()),
+            device,
+            queue,
+            pipeline_layout,
+            pipelines: Mutex::new(HashMap::new()),
+            bind_group,
+            params_buffer,
+            work_buffer,
+            prefix_buffer,
+            results_buffer,
+            counter_buffer,
+            finished_buffer,
+            staging_counter,
+            staging_finished,
+            staging_results,
+            max_slots,
             max_results,
         })
     }
 
-    fn get_buffers(&self) -> GpuBuffers {
-        if let Some(bufs) = self.buffer_pool.lock().unwrap().pop_front() {
-            return bufs;
-        }
-
-        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Params Buffer"),
-            size: std::mem::size_of::<SearchParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let results_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Results Buffer"),
-            size: (self.max_results as u64) * 8, // u64 ranks
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let counter_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Counter Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let staging_results = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Results"),
-            size: (self.max_results as u64) * 8,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let staging_counter = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Counter"),
-            size: 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Sparse Ruler Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.binomial_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: results_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: counter_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        GpuBuffers {
-            params_buffer,
-            results_buffer,
-            counter_buffer,
-            staging_results,
-            staging_counter,
-            bind_group,
-        }
+    fn pipeline(&self, words: u32) -> wgpu::ComputePipeline {
+        let mut pipelines = self.pipelines.lock().unwrap();
+        pipelines
+            .entry(words)
+            .or_insert_with(|| {
+                let source = include_str!("shader.wgsl").replace("__WORDS__", &words.to_string());
+                let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Sparse Ruler Shader"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("Sparse Ruler Compute Pipeline"),
+                        layout: Some(&self.pipeline_layout),
+                        module: &shader,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            })
+            .clone()
     }
 
-    fn return_buffers(&self, bufs: GpuBuffers) {
-        self.buffer_pool.lock().unwrap().push_back(bufs);
-    }
-
-    pub fn submit_search(&self, params: &SearchParams) -> GpuSearchTask {
-        let bufs = self.get_buffers();
-
-        self.queue
-            .write_buffer(&bufs.params_buffer, 0, bytemuck::cast_slice(&[*params]));
-        self.queue
-            .write_buffer(&bufs.counter_buffer, 0, bytemuck::cast_slice(&[0u32]));
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
-            });
-
-        let workgroup_size: u32 = std::env::var("GPU_WORKGROUP_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
-
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.pipeline);
-            compute_pass.set_bind_group(0, &bufs.bind_group, &[]);
-            let workgroup_count = params.batch_size.div_ceil(workgroup_size);
-            if workgroup_count <= 65535 {
-                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-            } else {
-                let x_groups = 65535;
-                let y_groups = workgroup_count.div_ceil(65535);
-                compute_pass.dispatch_workgroups(x_groups, y_groups, 1);
+    /// Maps the first `bytes` of each staging buffer and reads them, failing if the GPU does
+    /// not finish within `PASS_TIMEOUT` (for example after the driver reset a hung GPU).
+    fn read(&self, buffers: &[(&wgpu::Buffer, u64)]) -> Result<Vec<Vec<u32>>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, (buffer, bytes)) in buffers.iter().enumerate() {
+            let tx = tx.clone();
+            buffer
+                .slice(..*bytes)
+                .map_async(wgpu::MapMode::Read, move |r| tx.send((i, r)).unwrap());
+        }
+        let start = Instant::now();
+        let mut mapped = 0;
+        while mapped < buffers.len() {
+            self.device.poll(wgpu::Maintain::Poll);
+            match rx.recv_timeout(Duration::from_millis(1)) {
+                Ok((_, Ok(()))) => mapped += 1,
+                Ok((_, Err(e))) => return Err(format!("failed to read GPU results: {e}")),
+                Err(_) if start.elapsed() > PASS_TIMEOUT => {
+                    return Err(format!(
+                        "the GPU did not finish a pass within {PASS_TIMEOUT:?}; it may have been reset"
+                    ));
+                }
+                Err(_) => {}
             }
         }
+        Ok(buffers
+            .iter()
+            .map(|(buffer, bytes)| {
+                let slice = buffer.slice(..*bytes);
+                let data = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
+                buffer.unmap();
+                data
+            })
+            .collect())
+    }
 
-        encoder.copy_buffer_to_buffer(
-            &bufs.results_buffer,
-            0,
-            &bufs.staging_results,
-            0,
-            (self.max_results as u64) * 8,
-        );
-        encoder.copy_buffer_to_buffer(&bufs.counter_buffer, 0, &bufs.staging_counter, 0, 4);
+    /// Runs one pass. `work` holds a (slot, prefix index) pair per thread: the prefix index
+    /// points into `prefixes` (`params.prefix_depth` marks each) for a partial ruler starting
+    /// in that slot, or is `RESUME` to continue the slot's saved search.
+    pub fn run_pass(
+        &self,
+        params: &SearchParams,
+        work: &[u32],
+        prefixes: &[u32],
+    ) -> Result<Pass, String> {
+        self.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[*params]));
+        self.queue
+            .write_buffer(&self.work_buffer, 0, bytemuck::cast_slice(work));
+        if !prefixes.is_empty() {
+            self.queue
+                .write_buffer(&self.prefix_buffer, 0, bytemuck::cast_slice(prefixes));
+        }
+        self.queue
+            .write_buffer(&self.counter_buffer, 0, bytemuck::cast_slice(&[0u32; 4]));
 
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipeline(params.words));
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(params.num_work.div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.counter_buffer, 0, &self.staging_counter, 0, 16);
         self.queue.submit(Some(encoder.finish()));
 
-        let results_slice = bufs.staging_results.slice(..);
-        let counter_slice = bufs.staging_counter.slice(..);
+        let counters = self.read(&[(&self.staging_counter, 16)])?.remove(0);
+        let (found, finished) = (counters[0] as u64, counters[3] as u64);
+        let nodes = counters[1] as u64 | (counters[2] as u64) << 32;
 
-        let (r_sender, r_receiver) = std::sync::mpsc::channel();
-        let (c_sender, c_receiver) = std::sync::mpsc::channel();
-
-        results_slice.map_async(wgpu::MapMode::Read, move |v| r_sender.send(v).unwrap());
-        counter_slice.map_async(wgpu::MapMode::Read, move |v| c_sender.send(v).unwrap());
-
-        GpuSearchTask {
-            r_receiver,
-            c_receiver,
-            bufs,
+        // Copy back only the rulers and finished slots that were written.
+        let result_bytes = found * params.num_segments as u64 * 4;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut reads = Vec::new();
+        if finished > 0 {
+            encoder.copy_buffer_to_buffer(
+                &self.finished_buffer,
+                0,
+                &self.staging_finished,
+                0,
+                finished * 4,
+            );
+            reads.push((&self.staging_finished, finished * 4));
         }
+        if found > 0 {
+            encoder.copy_buffer_to_buffer(
+                &self.results_buffer,
+                0,
+                &self.staging_results,
+                0,
+                result_bytes,
+            );
+            reads.push((&self.staging_results, result_bytes));
+        }
+        if reads.is_empty() {
+            return Ok(Pass {
+                rulers: Vec::new(),
+                finished: Vec::new(),
+                nodes,
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let mut data = self.read(&reads)?.into_iter();
+        let finished = if finished > 0 { data.next().unwrap() } else { Vec::new() };
+        let rulers = if found > 0 { data.next().unwrap() } else { Vec::new() };
+        Ok(Pass {
+            rulers,
+            finished,
+            nodes,
+        })
     }
-
-    pub fn wait_for_search(&self, task: GpuSearchTask) -> Vec<u64> {
-        self.device.poll(wgpu::Maintain::Wait);
-
-        let results =
-            if let (Ok(Ok(())), Ok(Ok(()))) = (task.c_receiver.recv(), task.r_receiver.recv()) {
-                let counter_slice = task.bufs.staging_counter.slice(..);
-                let counter_data = counter_slice.get_mapped_range();
-                let count = bytemuck::cast_slice::<u8, u32>(&counter_data)[0] as usize;
-                drop(counter_data);
-                task.bufs.staging_counter.unmap();
-
-                let results_slice = task
-                    .bufs
-                    .staging_results
-                    .slice(0..(self.max_results as u64 * 8));
-                let results_data = results_slice.get_mapped_range();
-                let mut ranks = bytemuck::cast_slice::<u8, u64>(&results_data)
-                    [..count.min(self.max_results as usize)]
-                    .to_vec();
-                drop(results_data);
-                task.bufs.staging_results.unmap();
-
-                ranks.sort_unstable();
-                ranks.dedup();
-                ranks
-            } else {
-                Vec::new()
-            };
-
-        self.return_buffers(task.bufs);
-        results
-    }
-}
-
-fn binomial_u64(n: u64, k: u64) -> u64 {
-    if k > n {
-        return 0;
-    }
-    if k == 0 || k == n {
-        return 1;
-    }
-    let k = k.min(n - k);
-    let mut res = 1.0f64;
-    for i in 1..=k {
-        res = res * (n - i + 1) as f64 / i as f64;
-    }
-    res.round() as u64
 }

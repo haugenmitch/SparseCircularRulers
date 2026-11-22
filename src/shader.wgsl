@@ -1,203 +1,340 @@
+// Backtracking search for complete circular rulers; each thread searches one partial ruler,
+// in steps of at most node_budget nodes per pass.
+// This mirrors `Dfs::run` in search.rs: see there for the pruning rules.
+//
+// WORDS (32-bit words per bitset) is substituted when the pipeline is built, so every
+// bitset loop has a constant bound and unrolls. Words are only ever indexed by constants
+// (`word` picks a runtime index with selects), which keeps the bitsets in registers.
+//
+// Some forms crash the radv (Mesa 26) shader compiler and are avoided: early returns
+// inside loops, trailing-zero builtins inside loops, clamped constant indices such as
+// a[max(i, 1u) - 1u], and short loops ending in `break` that the compiler unrolls.
+
+const WORDS: u32 = __WORDS__u;
+
 struct Params {
     length: u32,
     num_segments: u32,
-    batch_size: u32,
-    start_rank_low: u32,
-    start_rank_high: u32,
-    steps_per_thread: u32,
+    num_work: u32,
+    prefix_depth: u32,
+    words: u32,
+    max_results: u32,
+    node_budget: u32,
+    _p0: u32,
 };
 
+const RESUME: u32 = 0xFFFFFFFFu;
+// Saved search state per slot: depth k, then pos[32], then nextp[32].
+const STATE_STRIDE: u32 = 65u;
+
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> binomial_table: array<u32>;
-@group(0) @binding(2) var<storage, read_write> results: array<u32>;
-@group(0) @binding(3) var<storage, read_write> found_counter: atomic<u32>;
+// Per thread: the slot it works in, and the index of the partial ruler to start there
+// (prefix_depth marks each in `prefixes`) or RESUME to continue the slot's saved search.
+@group(0) @binding(1) var<storage, read> work: array<u32>;
+@group(0) @binding(2) var<storage, read> prefixes: array<u32>;
+// Marks of complete rulers, num_segments per ruler.
+@group(0) @binding(3) var<storage, read_write> results: array<u32>;
+// [0] rulers found, [1] and [2] low and high words of the node count, [3] slots finished.
+@group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>, 4>;
+@group(0) @binding(5) var<storage, read_write> state: array<u32>;
+// Slots whose partial ruler was fully searched in this pass.
+@group(0) @binding(6) var<storage, read_write> finished: array<u32>;
 
-struct u64_ {
-    low: u32,
-    high: u32,
+alias Bits = array<u32, WORDS>;
+
+// Word j of a, or 0 if j is out of range.
+fn word(a: Bits, j: u32) -> u32 {
+    var v = 0u;
+    for (var t = 0u; t < WORDS; t++) { v = select(v, a[t], t == j); }
+    return v;
 }
 
-fn u64_add(a: u64_, b: u64_) -> u64_ {
-    var res: u64_;
-    let low = a.low + b.low;
-    let carry = u32(low < a.low);
-    res.low = low;
-    res.high = a.high + b.high + carry;
+fn bits_or(a: Bits, b: Bits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) { r[i] = a[i] | b[i]; }
+    return r;
+}
+
+fn bits_and(a: Bits, b: Bits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) { r[i] = a[i] & b[i]; }
+    return r;
+}
+
+fn bits_and_not(a: Bits, b: Bits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) { r[i] = a[i] & ~b[i]; }
+    return r;
+}
+
+fn bits_count(a: Bits) -> u32 {
+    var c = 0u;
+    for (var i = 0u; i < WORDS; i++) { c += countOneBits(a[i]); }
+    return c;
+}
+
+fn bits_is_empty(a: Bits) -> bool {
+    var any = 0u;
+    for (var i = 0u; i < WORDS; i++) { any |= a[i]; }
+    return any == 0u;
+}
+
+// Lowest set bit, or 0xFFFFFFFF if none.
+fn bits_lowest(a: Bits) -> u32 {
+    var res = 0xFFFFFFFFu;
+    for (var i = WORDS; i > 0u; i--) {
+        let x = a[i - 1u];
+        res = select(res, (i - 1u) * 32u + countOneBits((x & (0u - x)) - 1u), x != 0u);
+    }
     return res;
 }
 
-fn u64_sub(a: u64_, b: u64_) -> u64_ {
-    var res: u64_;
-    let low = a.low - b.low;
-    let borrow = u32(a.low < b.low);
-    res.low = low;
-    res.high = a.high - b.high - borrow;
-    return res;
+fn bits_shl(a: Bits, s: u32) -> Bits {
+    var r: Bits;
+    let w = s >> 5u;
+    let b = s & 31u;
+    for (var i = 0u; i < WORDS; i++) {
+        // i - w wraps around to a huge index (so word() gives 0) when i < w.
+        let lo = word(a, i - w);
+        let hi = word(a, i - w - 1u);
+        r[i] = (lo << b) | select(0u, hi >> (32u - b), b > 0u);
+    }
+    return r;
 }
 
-fn u64_lt(a: u64_, b: u64_) -> bool {
-    if (a.high < b.high) { return true; }
-    if (a.high > b.high) { return false; }
-    return a.low < b.low;
+fn bits_shr(a: Bits, s: u32) -> Bits {
+    var r: Bits;
+    let w = s >> 5u;
+    let b = s & 31u;
+    for (var i = 0u; i < WORDS; i++) {
+        let lo = word(a, i + w);
+        let hi = word(a, i + w + 1u);
+        r[i] = (lo >> b) | select(0u, hi << (32u - b), b > 0u);
+    }
+    return r;
 }
 
-fn get_binomial(n: u32, k: u32) -> u64_ {
-    if (k > n || k > 32u) { return u64_(0u, 0u); }
-    let index = n * 33u + k;
-    return u64_(binomial_table[index * 2u], binomial_table[index * 2u + 1u]);
+fn bits_shl1(a: Bits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) {
+        r[i] = (a[i] << 1u) | (word(a, i - 1u) >> 31u);
+    }
+    return r;
 }
 
-fn unrank(rank: u64_) -> array<u32, 32> {
-    var ruler = array<u32, 32>();
+fn bits_shr1(a: Bits) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) {
+        r[i] = (a[i] >> 1u) | (word(a, i + 1u) << 31u);
+    }
+    return r;
+}
+
+// Bits lo..=hi.
+fn bits_range(lo: u32, hi: u32) -> Bits {
+    var r: Bits;
+    for (var i = 0u; i < WORDS; i++) {
+        let base = i * 32u;
+        let a = max(lo, base);
+        let b = min(hi, base + 31u);
+        let width = b - a + 1u;
+        let m = select((1u << width) - 1u, 0xFFFFFFFFu, width == 32u);
+        r[i] = select(0u, m << (a - base), lo <= hi && a <= b);
+    }
+    return r;
+}
+
+fn bits_toggle(a: Bits, i: u32) -> Bits {
+    var r: Bits;
+    for (var t = 0u; t < WORDS; t++) {
+        r[t] = a[t] ^ select(0u, 1u << (i & 31u), t == (i >> 5u));
+    }
+    return r;
+}
+
+// Distances measured from a new mark at p, which lies after every existing mark.
+fn new_distances(marks: Bits, rev: Bits, p: u32) -> Bits {
+    let l = params.length;
+    return bits_or(bits_shr(rev, l - 1u - p), bits_shl(marks, l - p));
+}
+
+// Positions m + c and m + L - c for each mark m: where a new mark measures distance c.
+fn measuring(marks: Bits, c: u32) -> Bits {
+    return bits_or(bits_shl(marks, c), bits_shl(marks, params.length - c));
+}
+
+// Largest position allowed for mark j (s_1 <= s_{n-1} and room for later marks).
+fn limit(j: u32, pos2: u32) -> u32 {
+    let l = params.length;
     let n = params.num_segments;
-    let length = params.length;
-    
-    ruler[0] = 1u;
-    var current_s = length - 1u;
-    var current_k = n - 1u;
-    var r = rank;
-
-    for (var i: u32 = 1; i < n - 1u; i++) {
-        var val = 1u;
-        loop {
-            if (current_s <= val) { break; }
-            let count = get_binomial(current_s - val - 1u, current_k - 2u);
-            if (u64_lt(r, count)) { break; }
-            r = u64_sub(r, count);
-            val += 1u;
-        }
-        ruler[i] = val;
-        current_s -= val;
-        current_k -= 1u;
-    }
-    ruler[n - 1u] = current_s;
-    return ruler;
+    if (j == 2u) { return (l + 4u - n) / 2u; }
+    let a = l - (pos2 - 1u);
+    let b = n - 1u - j;
+    return select(0u, a - b, a >= b);
 }
 
-fn is_complete(ruler: ptr<function, array<u32, 32>>, length: u32, n: u32) -> bool {
-    var marks = array<u32, 8>(0,0,0,0,0,0,0,0);
-    var cp: u32 = 0;
-    marks[0] |= 1u;
-    for (var i: u32 = 1; i < n; i++) {
-        cp += (*ruler)[i - 1u];
-        if (cp < 256u) { marks[cp >> 5] |= (1u << (cp & 31u)); }
+// Reserves `count` result entries, all or none, so a ruler is never dropped or reported twice.
+// Returns the first entry, or RESUME if they do not fit. A thread that does not fit takes its
+// count back; while it is added, every other thread's reservation fails too, so the entries
+// handed out stay contiguous.
+fn reserve_results(count: u32) -> u32 {
+    let first = atomicAdd(&counters[0], count);
+    if (first + count > params.max_results) {
+        atomicSub(&counters[0], count);
+        return RESUME;
     }
-
-    let u32_blocks = (length + 31u) >> 5;
-    let bit_shift = length & 31u;
-    
-    var m2 = array<u32, 16>(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
-    let num_mark_blocks = (length + 31u) >> 5;
-    for (var i: u32 = 0; i < num_mark_blocks; i++) {
-        m2[i] |= marks[i];
-        let shift_blocks = length >> 5;
-        let shift_bits = length & 31u;
-        if (shift_bits == 0) {
-            if (i + shift_blocks < 16u) { m2[i + shift_blocks] |= marks[i]; }
-        } else {
-            if (i + shift_blocks < 16u) { m2[i + shift_blocks] |= marks[i] << shift_bits; }
-            if (i + shift_blocks + 1u < 16u) { m2[i + shift_blocks + 1u] |= marks[i] >> (32u - shift_bits); }
-        }
-    }
-
-    var diffs = array<u32, 8>(0,0,0,0,0,0,0,0);
-    for (var j: u32 = 0; j < num_mark_blocks; j++) { diffs[j] |= m2[j]; }
-
-    cp = 0;
-    for (var i: u32 = 1; i < n; i++) {
-        cp += (*ruler)[i - 1u];
-        let us = cp >> 5;
-        let bs = cp & 31u;
-        if (bs == 0u) {
-            for (var j: u32 = 0; j < num_mark_blocks; j++) { if (j + us < 16u) { diffs[j] |= m2[j + us]; } }
-        } else {
-            for (var j: u32 = 0; j < num_mark_blocks; j++) {
-                let low = m2[j + us];
-                var high = 0u;
-                if (j + us + 1u < 16u) { high = m2[j + us + 1u]; }
-                diffs[j] |= (low >> bs) | (high << (32u - bs));
-            }
-        }
-    }
-
-    let full_blocks = length >> 5;
-    for (var i: u32 = 0; i < full_blocks; i++) {
-        if (diffs[i] != 0xFFFFFFFFu) { return false; }
-    }
-    if (bit_shift > 0u) {
-        let mask = (1u << bit_shift) - 1u;
-        if ((diffs[full_blocks] & mask) != mask) { return false; }
-    }
-    return true;
+    return first;
 }
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_groups: vec3<u32>) {
-    let thread_idx = global_id.x + global_id.y * num_groups.x * 256u;
-    if (thread_idx >= params.batch_size) { return; }
-    
-    var current_rank = u64_add(u64_(params.start_rank_low, params.start_rank_high), u64_(thread_idx * params.steps_per_thread, 0u));
-    
-    var ruler = unrank(current_rank);
+// Each thread searches the partial ruler in its slot for up to node_budget nodes, then saves
+// where it got to, so no dispatch runs long enough to trip the driver's GPU timeout.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.num_work) { return; }
+
+    let l = params.length;
     let n = params.num_segments;
-    let length = params.length;
+    let d = params.prefix_depth;
+    let full = bits_range(1u, l - 1u);
+    let half = bits_range(1u, l / 2u);
+    let slot = work[idx * 2u];
+    let prefix = work[idx * 2u + 1u];
+    let base = slot * STATE_STRIDE;
 
-    for (var s: u32 = 0; s < params.steps_per_thread; s++) {
-        var canon = true;
-        if (n >= 3u) {
-            if (ruler[1] < ruler[n - 1u]) { canon = true; }
-            else if (ruler[1] > ruler[n - 1u]) { canon = false; }
-            else {
-                let m = (n - 1u) / 2u;
-                for (var i: u32 = 2; i <= m; i++) {
-                    if (ruler[i] < ruler[n - i]) { canon = true; break; }
-                    if (ruler[i] > ruler[n - i]) { canon = false; break; }
+    var pos: array<u32, 32>;
+    var nextp: array<u32, 32>;
+    var covs: array<Bits, 32>;
+    var marks: Bits;
+    var rev: Bits;
+    var k: u32;
+
+    if (prefix != RESUME) {
+        for (var i = 0u; i < d; i++) { pos[i] = prefixes[prefix * d + i]; }
+        k = d;
+        nextp[d] = pos[d - 1u] + 1u;
+    } else {
+        k = state[base];
+        for (var i = 0u; i < k; i++) { pos[i] = state[base + 1u + i]; }
+        for (var i = d; i <= k; i++) { nextp[i] = state[base + 33u + i]; }
+    }
+
+    // Rebuild the marks and the covered distances at each depth from the marks.
+    var cov: Bits;
+    for (var i = 0u; i < k; i++) {
+        let p = pos[i];
+        if (i > 0u) { cov = bits_or(cov, new_distances(marks, rev, p)); }
+        marks = bits_toggle(marks, p);
+        rev = bits_toggle(rev, l - 1u - p);
+        if (i + 1u >= d) { covs[i + 1u] = cov; }
+    }
+
+    var nodes = 0u;
+    var done = false;
+    loop {
+        if (nodes >= params.node_budget) { break; }
+
+        if (k == n - 1u) {
+            // Last mark: only positions that measure the two smallest missing distances.
+            let lo = pos[k - 1u] + 1u;
+            let hi = limit(k, pos[2]);
+            if (lo <= hi) {
+                let missing = bits_and_not(full, covs[k]);
+                var cand = bits_range(lo, hi);
+                let d0 = bits_lowest(missing);
+                if (d0 != 0xFFFFFFFFu) {
+                    cand = bits_and(cand, measuring(marks, d0));
+                    let zero = Bits();
+                    let pair = bits_or(bits_toggle(zero, d0), bits_toggle(zero, l - d0));
+                    let d1 = bits_lowest(bits_and_not(missing, pair));
+                    if (d1 != 0xFFFFFFFFu) { cand = bits_and(cand, measuring(marks, d1)); }
+                }
+                // Explicitly zeroed: a `var` declared in a loop without an initializer is not
+                // reset on each iteration here.
+                var good = Bits();
+                for (var w = 0u; w < WORDS; w++) {
+                    var bits = cand[w];
+                    loop {
+                        if (bits == 0u) { break; }
+                        let p = w * 32u + countOneBits((bits & (0u - bits)) - 1u);
+                        bits &= bits - 1u;
+                        nodes += 1u;
+                        if (bits_is_empty(bits_and_not(missing, new_distances(marks, rev, p)))) {
+                            good = bits_toggle(good, p);
+                        }
+                    }
+                }
+                let count = bits_count(good);
+                if (count > 0u) {
+                    let first = reserve_results(count);
+                    // No room left this pass: stop here and redo this mark next pass.
+                    if (first == RESUME) { break; }
+                    var slot_i = first;
+                    for (var w = 0u; w < WORDS; w++) {
+                        var bits = good[w];
+                        loop {
+                            if (bits == 0u) { break; }
+                            let p = w * 32u + countOneBits((bits & (0u - bits)) - 1u);
+                            bits &= bits - 1u;
+                            for (var i = 0u; i < k; i++) { results[slot_i * n + i] = pos[i]; }
+                            results[slot_i * n + k] = p;
+                            slot_i += 1u;
+                        }
+                    }
                 }
             }
-        }
-
-        if (canon) {
-            if (is_complete(&ruler, length, n)) {
-                let idx = atomicAdd(&found_counter, 1u);
-                if (idx < 65536u) {
-                    results[idx * 2u] = current_rank.low;
-                    results[idx * 2u + 1u] = current_rank.high;
-                }
-            }
         } else {
-            // Symmetry-Breaking Skip: If ruler[1] > ruler[n-1], we can skip the remaining
-            // combinations for the current s_1, s_2, ..., s_{n-2} values.
-            if (n >= 3u && ruler[1] > ruler[n - 1u] && ruler[n - 1u] > 1u) {
-                let skip = ruler[n - 1u] - 1u;
-                let steps_left = params.steps_per_thread - s - 1u;
-                let actual_skip = min(skip, steps_left);
-                
-                current_rank = u64_add(current_rank, u64_(actual_skip, 0u));
-                ruler[n - 2u] += actual_skip;
-                ruler[n - 1u] -= actual_skip;
-                s += actual_skip;
+            // Try positions p = nextp[k]..=limit; moving p by one shifts its new distances by one.
+            let ck = covs[k];
+            let lim = limit(k, pos[2]);
+            let k1 = k + 1u;
+            let r = n - k1;
+            let bound = r * k1 + (r * (r - 1u)) / 2u;
+            var p = nextp[k];
+            var up: Bits;
+            var down: Bits;
+            if (p <= lim) {
+                up = bits_shr(rev, l - 1u - p);
+                down = bits_shl(marks, l - p);
             }
-        }
-
-        // Increment
-        current_rank = u64_add(current_rank, u64_(1u, 0u));
-        if (n > 2u && ruler[n - 1u] > 1u) {
-            ruler[n - 1u] -= 1u;
-            ruler[n - 2u] += 1u;
-        } else {
-            var f = false;
-            for (var i: i32 = i32(n) - 2; i >= 2; i--) {
-                if (ruler[u32(i)] > 1u) {
-                    ruler[u32(i)] = 1u;
-                    ruler[u32(i - 1)] += 1u;
-                    var sum: u32 = 0;
-                    for (var j: u32 = 0; j < n - 1u; j++) { sum += ruler[j]; }
-                    ruler[n - 1u] = length - sum;
-                    f = true;
+            var descended = false;
+            loop {
+                if (p > lim) { break; }
+                nodes += 1u;
+                let nc = bits_or(ck, bits_or(up, down));
+                if (bits_count(bits_and_not(half, nc)) <= bound) {
+                    nextp[k] = p + 1u;
+                    pos[k] = p;
+                    marks = bits_toggle(marks, p);
+                    rev = bits_toggle(rev, l - 1u - p);
+                    covs[k1] = nc;
+                    k = k1;
+                    nextp[k] = p + 1u;
+                    descended = true;
                     break;
                 }
+                up = bits_shl1(up);
+                down = bits_shr1(down);
+                p += 1u;
             }
-            if (!f) { break; }
+            if (descended) { continue; }
         }
+
+        // Backtrack.
+        if (k == d) { done = true; break; }
+        k -= 1u;
+        marks = bits_toggle(marks, pos[k]);
+        rev = bits_toggle(rev, l - 1u - pos[k]);
     }
+
+    if (done) {
+        finished[atomicAdd(&counters[3], 1u)] = slot;
+    } else {
+        state[base] = k;
+        for (var i = 0u; i < k; i++) { state[base + 1u + i] = pos[i]; }
+        for (var i = d; i <= k; i++) { state[base + 33u + i] = nextp[i]; }
+    }
+
+    let old = atomicAdd(&counters[1], nodes);
+    if (old + nodes < old) { atomicAdd(&counters[2], 1u); }
 }

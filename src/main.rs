@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod gpu;
-use gpu::{GpuConfig, GpuContext, SearchParams};
+mod search;
+use gpu::{GpuContext, SearchParams};
+use search::{Dfs, Search};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -73,6 +75,7 @@ struct Solution {
 enum SearchStatus {
     Finished,
     Interrupted,
+    GpuFailed,
 }
 
 struct SearchProgress {
@@ -98,9 +101,11 @@ struct SearchTiming<'a> {
     cpu_start: &'a ProcessTime,
 }
 
-struct RangeContext<'a> {
-    length: u8,
-    num_segments: u8,
+/// The partial rulers (prefixes of `depth` marks each) that split one search.
+struct WorkContext<'a> {
+    search: &'a Search,
+    depth: usize,
+    prefixes: &'a [u8],
     interrupt: &'a AtomicBool,
     eval_counter: &'a AtomicU64,
     found_counter: &'a AtomicU64,
@@ -164,9 +169,29 @@ impl State {
             return SearchStatus::Finished;
         }
 
-        let (start_rank, mut found_rulers, base_clock_time, base_cpu_time) =
+        let (checkpoint, start_evaluated, mut found_rulers, base_clock_time, base_cpu_time) =
             self.initialize_solution(ctx);
         let start_found_count = found_rulers.len() as u64;
+
+        let length_clock_start = Instant::now();
+        let length_cpu_start = ProcessTime::now();
+
+        // Split the search tree into partial rulers (prefixes) that are searched independently.
+        let search = Search::new(ctx.length, ctx.num_segments);
+        let n = ctx.num_segments as usize;
+        let use_gpu = ctx.gpu.is_some() && n >= 3;
+        let target = if use_gpu { 1 << 21 } else { 1 << 16 };
+        let (depth, prefixes) = search.prefixes(target, (n - 2).max(2), 1 << 24);
+        let total_items = (prefixes.len() / depth) as u64;
+        let start_item = checkpoint.map_or(0, |marks| {
+            prefixes
+                .chunks(depth)
+                .collect::<Vec<_>>()
+                .partition_point(|p| {
+                    let m = p.len().min(marks.len());
+                    p[..m] < marks[..m]
+                }) as u64
+        });
 
         if !found_rulers.is_empty() {
             let mut latest = ctx.progress.latest_ruler.lock().unwrap();
@@ -176,37 +201,29 @@ impl State {
             *latest = None;
         }
 
-        let total_space = calculate_total_space(ctx.length, ctx.num_segments) as u64;
         self.setup_progress_bars(
             ctx,
-            start_rank,
-            total_space,
+            start_item,
+            total_items,
             found_rulers.len(),
             base_clock_time,
         );
 
-        let eval_counter = Arc::new(AtomicU64::new(start_rank));
+        let eval_counter = Arc::new(AtomicU64::new(start_evaluated));
+        let done_counter = Arc::new(AtomicU64::new(start_item));
         let found_counter = Arc::new(AtomicU64::new(start_found_count));
         let mut last_checkpoint = Instant::now();
-        let length_clock_start = Instant::now();
-        let length_cpu_start = ProcessTime::now();
 
-        const CHUNK_SIZE: u64 = 100_000_000;
         const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
         const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 
-        let mut current_rank = start_rank;
+        let mut current_item = start_item;
         let mut status = SearchStatus::Finished;
+        let mut gpu_work = ctx
+            .gpu
+            .filter(|_| use_gpu)
+            .map(|gpu| GpuWork::new(gpu, start_item, total_items));
 
-        let config = GpuConfig::for_length(ctx.length as u32);
-        let steps_per_thread: u32 = std::env::var("GPU_STEPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(config.steps_per_thread);
-        let threads_per_batch: u32 = std::env::var("GPU_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(config.threads_per_batch);
         let timing = SearchTiming {
             base_clock_time,
             base_cpu_time,
@@ -218,6 +235,7 @@ impl State {
         let ui_stop = Arc::new(AtomicBool::new(false));
         let ui_stop_clone = ui_stop.clone();
         let eval_counter_ui = eval_counter.clone();
+        let done_counter_ui = done_counter.clone();
         let found_counter_ui = found_counter.clone();
         let progress_pb_ui = ctx.progress.progress_pb.clone();
         let stats_pb_ui = ctx.progress.stats_pb.clone();
@@ -232,7 +250,7 @@ impl State {
                 let total_found = found_counter_ui.load(Ordering::Relaxed);
                 let elapsed = base_clock_time + length_clock_start.elapsed();
 
-                progress_pb_ui.set_position(total_evaluated);
+                progress_pb_ui.set_position(done_counter_ui.load(Ordering::Relaxed));
                 stats_pb_ui.set_position(total_evaluated);
 
                 let ruler_str = if let Ok(latest) = latest_ruler_ui.try_lock() {
@@ -255,53 +273,49 @@ impl State {
             }
         });
 
-        let range_ctx = RangeContext {
-            length: ctx.length,
-            num_segments: ctx.num_segments,
+        let work = WorkContext {
+            search: &search,
+            depth,
+            prefixes: &prefixes,
             interrupt: ctx.interrupt,
             eval_counter: &eval_counter,
             found_counter: &found_counter,
             latest_ruler: &ctx.progress.latest_ruler,
         };
 
-        while current_rank < total_space {
+        while current_item < total_items {
             if !ctx.interrupt.load(Ordering::SeqCst) {
                 status = SearchStatus::Interrupted;
                 break;
             }
 
-            let (new_current_rank, all_completed) = if let Some(gpu) = ctx.gpu {
-                let chunk_end = (current_rank + CHUNK_SIZE).min(total_space);
-                let (mut chunk_found, completed) =
-                    gpu_search_range(&range_ctx, gpu, current_rank, chunk_end, steps_per_thread, threads_per_batch);
-                found_rulers.append(&mut chunk_found);
-                (chunk_end, completed)
+            let all_completed = if let (Some(gpu), Some(gpu_work)) = (ctx.gpu, &mut gpu_work) {
+                if let Err(e) = gpu_work.pass(&work, gpu, &mut found_rulers) {
+                    ctx.progress.status_pb.suspend(|| eprintln!("\nError: {e}"));
+                    status = SearchStatus::GpuFailed;
+                    break;
+                }
+                current_item = gpu_work.unfinished;
+                // Partial rulers finish out of order; show how many are done.
+                done_counter.store(gpu_work.completed, Ordering::Relaxed);
+                true
             } else {
-                let num_threads = rayon::current_num_threads() as u64;
-                let batch_size = num_threads * 4;
-                let batch_end = (current_rank + batch_size * CHUNK_SIZE).min(total_space);
-                let chunk_starts: Vec<u64> = (current_rank..batch_end)
-                    .step_by(CHUNK_SIZE as usize)
-                    .collect();
-
-                let results: Vec<(Vec<Vec<u8>>, bool)> = chunk_starts
-                    .into_par_iter()
-                    .map(|chunk_start| {
-                        let chunk_end = (chunk_start + CHUNK_SIZE).min(total_space);
-                        search_range(&range_ctx, chunk_start, chunk_end)
-                    })
-                    .collect();
-
-                self.process_search_results(
-                    &mut found_rulers,
-                    results,
-                    current_rank,
-                    batch_end,
-                    CHUNK_SIZE,
-                )
+                let batch = rayon::current_num_threads() as u64 * 64;
+                let end = (current_item + batch).min(total_items);
+                match cpu_search_items(&work, current_item, end, &mut found_rulers) {
+                    Some(c) => {
+                        current_item = c;
+                        false
+                    }
+                    None => {
+                        current_item = end;
+                        true
+                    }
+                }
             };
-
-            current_rank = new_current_rank;
+            if gpu_work.is_none() {
+                done_counter.store(current_item, Ordering::Relaxed);
+            }
 
             if !all_completed {
                 status = SearchStatus::Interrupted;
@@ -312,7 +326,7 @@ impl State {
             if now.duration_since(last_checkpoint) >= CHECKPOINT_INTERVAL {
                 self.save_checkpoint(
                     ctx,
-                    current_rank,
+                    work.checkpoint(current_item),
                     eval_counter.load(Ordering::Relaxed),
                     &found_rulers,
                     &timing,
@@ -324,9 +338,13 @@ impl State {
         ui_stop.store(true, Ordering::Relaxed);
         let _ = ui_thread.join();
 
+        // A resumed search may repeat part of a prefix, so drop duplicates.
+        found_rulers.sort();
+        found_rulers.dedup();
+
         self.finalize_solution(
             ctx,
-            current_rank,
+            work.checkpoint(current_item),
             eval_counter.load(Ordering::Relaxed),
             found_rulers,
             &timing,
@@ -339,7 +357,7 @@ impl State {
     fn initialize_solution(
         &mut self,
         ctx: &SearchContext,
-    ) -> (u64, Vec<Vec<u8>>, Duration, Duration) {
+    ) -> (Option<Vec<u8>>, u64, Vec<Vec<u8>>, Duration, Duration) {
         let lb = get_num_segments_lower_bound(ctx.length);
         let solution = self.solutions.entry(ctx.length).or_insert(Solution {
             completed: false,
@@ -359,14 +377,19 @@ impl State {
             solution.checkpoint_ruler = None;
         }
 
-        let rank = if let Some(r) = solution.checkpoint_ruler.take() {
-            calculate_rank(ctx.length, ctx.num_segments, &r) as u64
-        } else {
-            solution.total_rulers_evaluated
-        };
+        // The checkpoint holds the segments of the first unfinished partial ruler; turn it
+        // back into mark positions.
+        let checkpoint = solution.checkpoint_ruler.take().map(|segments| {
+            let mut marks = vec![0u8];
+            for s in segments {
+                marks.push(marks.last().unwrap().saturating_add(s));
+            }
+            marks
+        });
 
         (
-            rank,
+            checkpoint,
+            solution.total_rulers_evaluated,
             std::mem::take(&mut solution.rulers),
             solution.total_clock_time,
             solution.total_cpu_time,
@@ -376,15 +399,13 @@ impl State {
     fn setup_progress_bars(
         &self,
         ctx: &SearchContext,
-        start_rank: u64,
-        total_space: u64,
+        start_item: u64,
+        total_items: u64,
         found_count: usize,
         base_clock_time: Duration,
     ) {
-        ctx.progress.progress_pb.set_length(total_space);
-        ctx.progress.stats_pb.set_length(total_space);
-        ctx.progress.progress_pb.set_position(start_rank);
-        ctx.progress.stats_pb.set_position(start_rank);
+        ctx.progress.progress_pb.set_length(total_items);
+        ctx.progress.progress_pb.set_position(start_item);
 
         ctx.progress.status_pb.set_message(format!(
             "{}: Found {} rulers with {} segments in {:?}",
@@ -392,43 +413,17 @@ impl State {
         ));
     }
 
-    fn process_search_results(
-        &self,
-        found_rulers: &mut Vec<Vec<u8>>,
-        results: Vec<(Vec<Vec<u8>>, bool)>,
-        current_rank: u64,
-        batch_end: u64,
-        chunk_size: u64,
-    ) -> (u64, bool) {
-        let mut all_completed = true;
-        let mut first_incomplete_rank = batch_end;
-
-        for (i, (mut chunk_found, completed)) in results.into_iter().enumerate() {
-            let chunk_start = current_rank + (i as u64 * chunk_size);
-            if all_completed {
-                found_rulers.append(&mut chunk_found);
-                if !completed {
-                    all_completed = false;
-                    first_incomplete_rank = chunk_start;
-                }
-            }
-        }
-
-        (first_incomplete_rank, all_completed)
-    }
-
     fn save_checkpoint(
         &mut self,
         ctx: &SearchContext,
-        current_rank: u64,
+        checkpoint: Option<Vec<u8>>,
         total_evaluated: u64,
         found_rulers: &[Vec<u8>],
         timing: &SearchTiming,
     ) {
         let (found, time) = {
             let solution = self.solutions.get_mut(&ctx.length).unwrap();
-            solution.checkpoint_ruler =
-                Some(unrank(ctx.length, ctx.num_segments, current_rank as f64));
+            solution.checkpoint_ruler = checkpoint;
             solution.total_rulers_evaluated = total_evaluated;
             solution.rulers = found_rulers.to_owned();
             solution.rulers_found = solution.rulers.len() as u64;
@@ -448,7 +443,7 @@ impl State {
     fn finalize_solution(
         &mut self,
         ctx: &SearchContext,
-        current_rank: u64,
+        checkpoint: Option<Vec<u8>>,
         total_evaluated: u64,
         found_rulers: Vec<Vec<u8>>,
         timing: &SearchTiming,
@@ -461,203 +456,174 @@ impl State {
         solution.total_clock_time = timing.base_clock_time + timing.clock_start.elapsed();
         solution.total_cpu_time = timing.base_cpu_time + timing.cpu_start.elapsed();
 
-        if status == SearchStatus::Interrupted {
-            solution.checkpoint_ruler =
-                Some(unrank(ctx.length, ctx.num_segments, current_rank as f64));
+        solution.checkpoint_ruler = if status == SearchStatus::Interrupted {
+            checkpoint
         } else {
-            solution.checkpoint_ruler = None;
-        }
+            None
+        };
 
         self.recalculate_global_metrics();
     }
 }
 
-fn gpu_search_range(
-    ctx: &RangeContext,
-    gpu: &GpuContext,
-    start_rank: u64,
-    end_rank: u64,
-    steps_per_thread: u32,
-    threads_per_batch: u32,
-) -> (Vec<Vec<u8>>, bool) {
-    let mut current_rank = start_rank;
-    let mut found_rulers = Vec::new();
-
-    let total_steps_per_batch = (steps_per_thread as u64) * (threads_per_batch as u64);
-
-    let mut in_flight = std::collections::VecDeque::new();
-    const MAX_IN_FLIGHT: usize = 2;
-
-    while current_rank < end_rank || !in_flight.is_empty() {
-        while current_rank < end_rank && in_flight.len() < MAX_IN_FLIGHT {
-            if !ctx.interrupt.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let remaining = end_rank - current_rank;
-            let this_batch_threads = if remaining >= total_steps_per_batch {
-                threads_per_batch
-            } else {
-                remaining.div_ceil(steps_per_thread as u64) as u32
-            };
-
-            let params = SearchParams {
-                length: ctx.length as u32,
-                num_segments: ctx.num_segments as u32,
-                batch_size: this_batch_threads,
-                start_rank_low: (current_rank & 0xFFFFFFFF) as u32,
-                start_rank_high: (current_rank >> 32) as u32,
-                steps_per_thread,
-                _padding: [0; 2],
-            };
-
-            let task = gpu.submit_search(&params);
-            let processed = (this_batch_threads as u64) * (steps_per_thread as u64);
-            in_flight.push_back((task, processed.min(remaining)));
-            current_rank += processed.min(remaining);
-        }
-
-        if let Some((task, batch_processed)) = in_flight.pop_front() {
-            let found_ranks = gpu.wait_for_search(task);
-            for rank in found_ranks {
-                let r = unrank(ctx.length, ctx.num_segments, rank as f64);
-                if is_canonical(&r) {
-                    {
-                        let mut latest = ctx.latest_ruler.lock().unwrap();
-                        *latest = Some(r.clone());
-                    }
-                    found_rulers.push(r);
-                    ctx.found_counter.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            ctx.eval_counter
-                .fetch_add(batch_processed, Ordering::Relaxed);
-        }
-
-        if !ctx.interrupt.load(Ordering::SeqCst) && current_rank < end_rank {
-            break;
-        }
+impl WorkContext<'_> {
+    fn prefix(&self, item: u64) -> &[u8] {
+        let i = item as usize * self.depth;
+        &self.prefixes[i..i + self.depth]
     }
 
-    found_rulers.sort();
-    found_rulers.dedup();
+    /// The segments of the first unfinished partial ruler, saved so a resumed search skips
+    /// every partial ruler before it.
+    fn checkpoint(&self, item: u64) -> Option<Vec<u8>> {
+        (item < (self.prefixes.len() / self.depth) as u64)
+            .then(|| self.prefix(item).windows(2).map(|w| w[1] - w[0]).collect())
+    }
 
-    (found_rulers, current_rank >= end_rank)
+    fn record(&self, rulers: &[Vec<u8>]) {
+        if let Some(last) = rulers.last() {
+            self.found_counter
+                .fetch_add(rulers.len() as u64, Ordering::Relaxed);
+            if let Ok(mut latest) = self.latest_ruler.try_lock() {
+                *latest = Some(last.clone());
+            }
+        }
+    }
 }
 
-/// Searches a specific range of ruler ranks for complete sparse rulers.
-///
-/// Returns a tuple containing:
-/// 1. The list of found rulers.
-/// 2. The number of evaluations performed.
-/// 3. A boolean indicating if the range was fully searched (true) or interrupted (false).
-fn search_range(ctx: &RangeContext, start_rank: u64, end_rank: u64) -> (Vec<Vec<u8>>, bool) {
-    let n = ctx.num_segments as usize;
-    let mut ruler = unrank(ctx.length, ctx.num_segments, start_rank as f64);
-    let mut current_rank = start_rank;
-    let mut found_rulers = Vec::new();
+/// Searches partial rulers `start..end` on the thread pool, appending the rulers found to
+/// `found_rulers`. Returns the first item that was not finished if the search was interrupted.
+fn cpu_search_items(
+    ctx: &WorkContext,
+    start: u64,
+    end: u64,
+    found_rulers: &mut Vec<Vec<u8>>,
+) -> Option<u64> {
+    let results: Vec<(Vec<Vec<u8>>, bool)> = (start..end)
+        .into_par_iter()
+        .map(|item| {
+            let mut dfs = Dfs::new(ctx.search, ctx.interrupt, ctx.eval_counter);
+            dfs.run(&ctx.search.node_from_marks(ctx.prefix(item)));
+            dfs.flush();
+            ctx.record(&dfs.found);
+            (dfs.found, !dfs.interrupted)
+        })
+        .collect();
 
-    // Pre-calculate constants for is_complete
-    let l_shift = ctx.length as usize;
-    let u64_blocks = l_shift >> 6;
-    let bit_shift = l_shift & 63;
-    let final_mask = if (ctx.length as usize) & 63 > 0 {
-        (1u64 << ((ctx.length as usize) & 63)) - 1
-    } else {
-        0
-    };
-
-    let mut local_evals = 0;
-    let mut last_eval_update = 0;
-    const COUNTER_UPDATE_INTERVAL: u64 = 10_000;
-    const INTERRUPT_CHECK_INTERVAL: u64 = 1_024;
-
-    while current_rank < end_rank {
-        // Efficiency: Periodic interrupt check to minimize atomic overhead
-        if local_evals & (INTERRUPT_CHECK_INTERVAL - 1) == 0
-            && !ctx.interrupt.load(Ordering::Relaxed)
-        {
-            ctx.eval_counter
-                .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
-            return (found_rulers, false);
+    for (offset, (mut found, completed)) in results.into_iter().enumerate() {
+        if !completed {
+            return Some(start + offset as u64);
         }
+        found_rulers.append(&mut found);
+    }
+    None
+}
 
-        // Symmetry Breaking: Full lexicographical comparison to break all rotation and reflection symmetries.
-        if is_canonical(&ruler) {
-            if is_complete(&ruler, u64_blocks, bit_shift, final_mask) {
-                found_rulers.push(ruler.clone());
-                ctx.found_counter.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut latest) = ctx.latest_ruler.try_lock() {
-                    *latest = Some(ruler.clone());
-                }
-            }
-            current_rank += 1;
-        } else {
-            current_rank += 1;
+/// Partial rulers being searched on the GPU. Each occupies a GPU slot, which keeps its search
+/// state between passes, until it is fully searched; then the slot takes the next one.
+struct GpuWork {
+    slot_item: Vec<Option<u64>>,
+    free_slots: Vec<u32>,
+    active_slots: Vec<u32>,
+    next_item: u64,
+    done: Vec<bool>,
+    /// The first partial ruler not fully searched yet.
+    unfinished: u64,
+    /// Partial rulers fully searched, counting those before the starting one.
+    completed: u64,
+    node_budget: u32,
+}
 
-            // Symmetry-Breaking Skip: If ruler[1] > ruler[n-1], we can skip the remaining
-            // combinations for the current s_1, s_2, ..., s_{n-2} values.
-            if n >= 3 && ruler[1] > ruler[n - 1] && ruler[n - 1] > 1 {
-                let skip = (ruler[n - 1] - 1) as u64;
-                let next_rank = current_rank + skip;
-
-                if next_rank <= end_rank {
-                    current_rank = next_rank;
-                    local_evals += skip;
-                    ruler[n - 2] += ruler[n - 1] - 1;
-                    ruler[n - 1] = 1;
-                } else {
-                    // Cannot skip beyond the assigned range; cap at end_rank
-                    let actual_skip = end_rank - current_rank;
-                    local_evals += actual_skip;
-                    ctx.eval_counter
-                        .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
-                    return (found_rulers, true);
-                }
-            }
-        }
-
-        local_evals += 1;
-        if local_evals - last_eval_update >= COUNTER_UPDATE_INTERVAL {
-            ctx.eval_counter
-                .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
-            last_eval_update = local_evals;
-        }
-
-        if current_rank >= end_rank {
-            break;
-        }
-
-        // Permutation Logic (Odometer-style)
-        if n > 2 && ruler[n - 1] > 1 {
-            ruler[n - 1] -= 1;
-            ruler[n - 2] += 1;
-        } else {
-            let mut all_attempted = false;
-            for i in (1..n - 1).rev() {
-                if i == 1 {
-                    all_attempted = true;
-                    break;
-                }
-                if ruler[i] == 1 {
-                    continue;
-                } else {
-                    ruler[i] = 1;
-                    ruler[i - 1] += 1;
-                    let current_sum: u16 = ruler[0..n - 1].iter().map(|&x| x as u16).sum();
-                    ruler[n - 1] = ctx.length - (current_sum as u8);
-                    break;
-                }
-            }
-            if all_attempted || n < 3 {
-                break;
-            }
+impl GpuWork {
+    fn new(gpu: &GpuContext, start: u64, total: u64) -> Self {
+        GpuWork {
+            slot_item: vec![None; gpu.max_slots as usize],
+            free_slots: (0..gpu.max_slots).rev().collect(),
+            active_slots: Vec::new(),
+            next_item: start,
+            done: vec![false; total as usize],
+            unfinished: start,
+            completed: start,
+            node_budget: 1 << 12,
         }
     }
 
-    ctx.eval_counter
-        .fetch_add(local_evals - last_eval_update, Ordering::Relaxed);
-    (found_rulers, current_rank >= end_rank)
+    /// Fills free slots with the next partial rulers, runs one GPU pass, and collects the
+    /// rulers it found.
+    fn pass(
+        &mut self,
+        ctx: &WorkContext,
+        gpu: &GpuContext,
+        found_rulers: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let n = ctx.search.num_segments();
+        let length = ctx.search.length();
+        let total = self.done.len() as u64;
+
+        let mut work = Vec::new();
+        for &slot in &self.active_slots {
+            work.extend([slot, gpu::RESUME]);
+        }
+        let mut prefixes = Vec::new();
+        let mut fresh = 0;
+        while self.next_item < total {
+            let Some(slot) = self.free_slots.pop() else { break };
+            self.slot_item[slot as usize] = Some(self.next_item);
+            self.active_slots.push(slot);
+            work.extend([slot, fresh]);
+            prefixes.extend(ctx.prefix(self.next_item).iter().map(|&m| m as u32));
+            self.next_item += 1;
+            fresh += 1;
+        }
+
+        let params = SearchParams {
+            length: length as u32,
+            num_segments: n as u32,
+            num_work: (work.len() / 2) as u32,
+            prefix_depth: ctx.depth as u32,
+            words: (length as u32).div_ceil(32),
+            max_results: gpu.max_results,
+            node_budget: self.node_budget,
+            _padding: 0,
+        };
+        let start = Instant::now();
+        let pass = gpu.run_pass(&params, &work, &prefixes)?;
+        // Keep each pass short (well under the driver's GPU timeout) but long enough that
+        // launching it is cheap.
+        let elapsed = start.elapsed();
+        if elapsed < Duration::from_millis(100) {
+            self.node_budget = (self.node_budget * 2).min(1 << 22);
+        } else if elapsed > Duration::from_millis(500) {
+            self.node_budget = (self.node_budget / 2).max(1 << 8);
+        }
+
+        ctx.eval_counter.fetch_add(pass.nodes, Ordering::Relaxed);
+        // The GPU only applies the s_1 <= s_{n-1} symmetry rule; keep the canonical rulers.
+        let mut found: Vec<Vec<u8>> = pass
+            .rulers
+            .chunks(n)
+            .map(|pos| {
+                let pos: Vec<u8> = pos.iter().map(|&p| p as u8).collect();
+                ctx.search.segments(&pos)
+            })
+            .filter(|r| is_canonical(r))
+            .collect();
+        ctx.record(&found);
+        found_rulers.append(&mut found);
+
+        for slot in pass.finished {
+            let item = self.slot_item[slot as usize].take().unwrap();
+            self.done[item as usize] = true;
+            self.completed += 1;
+            self.free_slots.push(slot);
+        }
+        let slot_item = &self.slot_item;
+        self.active_slots
+            .retain(|&slot| slot_item[slot as usize].is_some());
+        while self.unfinished < total && self.done[self.unfinished as usize] {
+            self.unfinished += 1;
+        }
+        Ok(())
+    }
 }
 
 fn default_version() -> String {
@@ -784,100 +750,6 @@ fn get_num_segments_lower_bound(length: u8) -> u8 {
     (((length as f64 * 4.0 - 3.0).sqrt() + 1.0) / 2.0).ceil() as u8
 }
 
-/// Calculate the total number of possible rulers for a given length and number
-/// of segments. This uses the "Stars and Bars". For a ruler of length L with n
-/// segments where the first segment is fixed at 1, we are looking for the
-/// number of compositions of (L-1) into (n-1) parts, where each part s_i >= 1.
-/// The formula is binom((L-1) - 1, (n-1) - 1) = binom(L-2, n-2).
-fn calculate_total_space(length: u8, num_segments: u8) -> f64 {
-    if num_segments < 2 || length < num_segments {
-        return 0.0;
-    }
-    binomial(length as u64 - 2, num_segments as u64 - 2)
-}
-
-/// Calculate the lexicographical rank of a given ruler in the search space.
-///
-/// This implements a ranking algorithm for compositions. The rank is determined by
-/// summing the number of compositions that would appear before the current one
-/// in a lexicographical sort.
-///
-/// For a component s_i at position k, we skip all compositions where the value
-/// at this position is j < s_i. The number of such compositions is:
-/// Sum_{j=1}^{s_i-1} binom((remaining_sum - j) - 1, (remaining_parts - 1) - 1)
-/// Using the Hockey-stick identity, this sum simplifies to:
-/// binom(remaining_sum - 1, remaining_parts - 1) - binom(remaining_sum - s_i, remaining_parts - 1)
-fn calculate_rank(length: u8, num_segments: u8, segments: &[u8]) -> f64 {
-    if num_segments < 2 {
-        return 0.0;
-    }
-    let s = length as u64 - 1;
-    let k = num_segments as u64 - 1;
-    let mut current_s = s;
-    let mut current_k = k;
-    let mut rank = 0.0;
-
-    for &val in &segments[1..num_segments as usize - 1] {
-        let val = val as u64;
-        rank += binomial(current_s - 1, current_k - 1) - binomial(current_s - val, current_k - 1);
-        current_s -= val;
-        current_k -= 1;
-    }
-    rank
-}
-
-/// Computes the composition (ruler) corresponding to a given lexicographical rank.
-///
-/// This is the inverse of `calculate_rank`. It reconstructs the sequence of
-/// segment lengths by iteratively determining how many compositions start with
-/// each possible value for the current segment.
-fn unrank(length: u8, num_segments: u8, mut rank: f64) -> Vec<u8> {
-    let mut segments = vec![1u8; num_segments as usize];
-    segments[0] = 1;
-    let mut current_s = length as u64 - 1;
-    let mut current_k = num_segments as u64 - 1;
-
-    for segment in segments.iter_mut().take(num_segments as usize - 1).skip(1) {
-        let mut val = 1;
-        loop {
-            if current_s <= val {
-                break;
-            }
-            let n_binom = current_s - val - 1;
-            let k_binom = current_k - 2;
-            let count = binomial(n_binom, k_binom);
-
-            if rank < count {
-                break;
-            }
-            rank -= count;
-            val += 1;
-        }
-        *segment = val as u8;
-        current_s -= val;
-        current_k -= 1;
-    }
-    segments[num_segments as usize - 1] = current_s as u8;
-    segments
-}
-
-/// Calculate binomial coefficient (n choose k) using the multiplicative formula.
-/// res = product_{i=1}^{k} (n - i + 1) / i
-fn binomial(n: u64, k: u64) -> f64 {
-    if k > n {
-        return 0.0;
-    }
-    if k == 0 || k == n {
-        return 1.0;
-    }
-    let k = k.min(n - k);
-    let mut res = 1.0;
-    for i in 1..=k {
-        res = res * (n - i + 1) as f64 / i as f64;
-    }
-    res
-}
-
 /// Checks if a ruler is "canonical" (the lexicographical minimum among all its rotations and reflections).
 ///
 /// A circular ruler can be represented by many different segment sequences depending on
@@ -932,108 +804,6 @@ fn is_canonical(ruler: &[u8]) -> bool {
     }
 
     true
-}
-
-/// Verifies if a ruler is "complete" (can measure all lengths from 1 to L) using bitwise operations.
-///
-/// A ruler is complete if for every distance d in [1, L], there exist marks m1, m2 such that:
-/// (m1 - m2) mod L == d OR (m2 - m1) mod L == d
-///
-/// This implementation uses a bitset (marks) where bit i is set if position i has a mark.
-/// The set of all measurable distances is (M | (M << L)) integrated over all mark positions.
-///
-/// ### Parameters:
-/// * `segments`: The relative lengths between consecutive marks.
-/// * `u64_blocks`: Pre-calculated `L / 64`, used for block-level bitwise shifts and validation.
-/// * `bit_shift`: Pre-calculated `L % 64`, used for bit-level shifts within a block.
-/// * `final_mask`: A bitmask (all 1s for the first `L % 64` bits) to check the final partial block.
-fn is_complete(segments: &[u8], u64_blocks: usize, bit_shift: usize, final_mask: u64) -> bool {
-    let n = segments.len();
-    let mut marks = [0u64; 4]; // Supports up to length 256
-    let mut current_pos = 0;
-
-    // Step 1: Populate the bitset with mark positions
-    marks[0] |= 1; // First mark is always at 0
-    for &s in &segments[..n - 1] {
-        current_pos += s as usize;
-        if current_pos < 256 {
-            // Divide current_pos by 64 to index into the proper u64 in the
-            // array, then set the bit at the proper position in that u64.
-            marks[current_pos >> 6] |= 1 << (current_pos & 63);
-        }
-    }
-
-    // Step 2: Create a virtual bitset m2 representing (M | (M << L))
-    // This virtual bitset is crucial for handling circular/modular wrap-around.
-    // By duplicating the marks at position L (via shifting), any modular distance
-    // (m1 - m2) mod L can be found by a simple linear shift in the next step.
-    // m2 is double the size of marks (8 * 64 bits) to accommodate the shift.
-    let mut m2 = [0u64; 8];
-    for i in 0..4 {
-        // Copy original marks
-        m2[i] |= marks[i];
-
-        // Shift and OR the marks into the higher blocks of m2 to represent (M << L)
-        if bit_shift == 0 {
-            // Optimization: L is a perfect multiple of 64
-            if i + u64_blocks < 8 {
-                m2[i + u64_blocks] |= marks[i];
-            }
-        } else {
-            // General case: L shift spans across block boundaries
-            if i + u64_blocks < 8 {
-                m2[i + u64_blocks] |= marks[i] << bit_shift;
-            }
-            if i + u64_blocks + 1 < 8 {
-                m2[i + u64_blocks + 1] |= marks[i] >> (64 - bit_shift);
-            }
-        }
-    }
-
-    // Step 3: Calculate measurable distances (differences between marks)
-    // We compute the union of the bitset shifted by every mark position.
-    // Mathematically, if bit 'd' is set in the result, it means there exists
-    // a pair of marks (m1, m2) such that (m1 - m2) mod L == d.
-    // By shifting the virtual bitset m2 (which contains duplicated marks at +L),
-    // we correctly capture wrap-around distances in a single linear pass.
-    let mut diffs = [0u64; 4];
-    current_pos = 0;
-
-    // Shift for mark at position 0 (Identity shift)
-    for j in 0..4 {
-        diffs[j] |= m2[j];
-    }
-
-    // Shift for all other mark positions
-    for &s in &segments[..n - 1] {
-        current_pos += s as usize;
-        let u_shift = current_pos >> 6; // Number of full 64-bit blocks to shift
-        let b_shift = current_pos & 63; // Number of bits to shift within a block
-
-        if b_shift == 0 {
-            // Optimization: Aligning on a 64-bit boundary allows a direct OR
-            for j in 0..4 {
-                diffs[j] |= m2[j + u_shift];
-            }
-        } else {
-            // General case: The shift spans across two adjacent u64 blocks in m2.
-            // We extract the relevant bits from the 'current' and 'next' blocks.
-            for j in 0..4 {
-                diffs[j] |= (m2[j + u_shift] >> b_shift) | (m2[j + u_shift + 1] << (64 - b_shift));
-            }
-        }
-    }
-
-    // Step 4: Verify that all bits from 1 to L-1 are set
-    // A ruler is complete if every bit corresponding to a distance [1, L-1] is 1.
-    // We first check all full 64-bit blocks for speed (must be all 1s).
-    if diffs.iter().take(u64_blocks).any(|&d| d != !0) {
-        return false;
-    }
-
-    // Finally, check the last partial block if L is not a multiple of 64.
-    // The final_mask ensures we only look at bits up to L-1 and ignore padding.
-    !(final_mask > 0 && (diffs[u64_blocks] & final_mask) != final_mask)
 }
 
 /// Orchestrates the execution of the sparse ruler search across a range of lengths.
@@ -1107,6 +877,7 @@ fn execute(
     })
     .expect("Error setting Ctrl-C handler");
 
+    let mut last_save = Instant::now();
     for i in start_length..=end_length {
         if !interrupt.load(Ordering::SeqCst) {
             break;
@@ -1153,6 +924,13 @@ fn execute(
 
                     if found > 0 {
                         state.recalculate_global_metrics();
+                        // Save finished lengths every so often, so a crash loses little work.
+                        if last_save.elapsed() >= Duration::from_secs(10) {
+                            if let Err(e) = save_state(&state, save_path.as_deref()) {
+                                eprintln!("Warning: failed to save state: {e}");
+                            }
+                            last_save = Instant::now();
+                        }
                         if !quiet {
                             mp.suspend(|| {
                                 println!(
@@ -1170,18 +948,21 @@ fn execute(
                     }
                     num_segments += 1;
                 }
-                SearchStatus::Interrupted => {
+                SearchStatus::Interrupted | SearchStatus::GpuFailed => {
                     progress.status_pb.finish_and_clear();
                     progress.progress_pb.finish_and_clear();
                     progress.stats_pb.finish_and_clear();
-                    if !quiet {
+                    let failed = status == SearchStatus::GpuFailed;
+                    if failed {
+                        eprintln!("\nGPU search failed, saving and exiting...");
+                    } else if !quiet {
                         println!("\nReceived interrupt, saving and exiting...");
                     }
                     if let Err(e) = save_state(&state, save_path.as_deref()) {
                         let destination = save_path.as_deref().unwrap_or("stdout");
                         eprintln!("Error: Failed to save state to '{}': {}", destination, e);
                     }
-                    std::process::exit(0);
+                    std::process::exit(if failed { 1 } else { 0 });
                 }
             }
         }
@@ -1268,7 +1049,7 @@ fn main() {
     state.recalculate_global_metrics();
 
     let gpu_ctx = if cli.gpu {
-        let ctx = pollster::block_on(GpuContext::new(65536));
+        let ctx = pollster::block_on(GpuContext::new(1 << 18, 1 << 18));
         if ctx.is_none() {
             eprintln!(
                 "Error: Failed to initialize GPU. Ensure you have a compatible graphics card and drivers installed."
@@ -1323,61 +1104,6 @@ mod tests {
         // Test with multiple 1s
         assert!(is_canonical(&[1, 1, 2, 1, 1, 3]));
         assert!(!is_canonical(&[1, 1, 3, 1, 1, 2])); // Reflection is smaller
-    }
-
-    #[test]
-    fn test_binomial() {
-        assert_eq!(binomial(5, 2), 10.0);
-        assert_eq!(binomial(10, 5), 252.0);
-        assert_eq!(binomial(10, 0), 1.0);
-        assert_eq!(binomial(10, 10), 1.0);
-    }
-
-    #[test]
-    fn test_is_complete() {
-        let length = 6;
-        let u64_blocks = length >> 6;
-        let bit_shift = length & 63;
-        let final_mask = (1u64 << (length & 63)) - 1;
-
-        // Length 6, 3 segments: [1, 2, 3] is a ruler for length 6
-        assert!(is_complete(&[1, 2, 3], u64_blocks, bit_shift, final_mask));
-
-        // Length 6, [2, 2, 2] is not complete
-        assert!(!is_complete(&[2, 2, 2], u64_blocks, bit_shift, final_mask));
-
-        let length = 13;
-        let u64_blocks = length >> 6;
-        let bit_shift = length & 63;
-        let final_mask = (1u64 << (length & 63)) - 1;
-        // L=13, k=4 ruler: [1, 3, 2, 7]
-        // Marks: 0, 1, 4, 6.
-        // Diff 1-0=1, 4-0=4, 6-0=6, 4-1=3, 6-1=5, 6-4=2.
-        // Modular diffs: 0-6=7, 0-4=9, 0-1=12, 1-6=8, 4-6=11, 1-4=10.
-        // All present!
-        assert!(is_complete(
-            &[1, 3, 2, 7],
-            u64_blocks,
-            bit_shift,
-            final_mask
-        ));
-    }
-
-    #[test]
-    fn test_rank_unrank() {
-        let length = 10;
-        let num_segments = 4;
-        let segments = vec![1, 2, 3, 4];
-        let rank = calculate_rank(length, num_segments, &segments);
-        let unranked = unrank(length, num_segments, rank);
-        assert_eq!(segments, unranked);
-
-        let length = 20;
-        let num_segments = 6;
-        let segments = vec![1, 1, 1, 1, 1, 15];
-        let rank = calculate_rank(length, num_segments, &segments);
-        let unranked = unrank(length, num_segments, rank);
-        assert_eq!(segments, unranked);
     }
 
     #[test]
