@@ -520,11 +520,20 @@ fn cpu_search_items(
 
 /// Partial rulers being searched on the GPU. Each occupies a GPU slot, which keeps its search
 /// state between passes, until it is fully searched; then the slot takes the next one.
+///
+/// A few partial rulers have far larger subtrees than the rest, so once every partial ruler
+/// has started and most slots are idle, the slots still busy are split: what each has left to
+/// search is handed out again as deeper partial rulers, which fill the idle slots.
 struct GpuWork {
+    /// The original partial ruler (item) that each slot's partial ruler came from.
     slot_item: Vec<Option<u64>>,
     free_slots: Vec<u32>,
     active_slots: Vec<u32>,
     next_item: u64,
+    /// Partial rulers split off busy slots, waiting for a slot, with their items.
+    split: Vec<(u64, Vec<u8>)>,
+    /// Partial rulers of each item still in a slot or waiting for one.
+    outstanding: Vec<u32>,
     done: Vec<bool>,
     /// The first partial ruler not fully searched yet.
     unfinished: u64,
@@ -540,10 +549,21 @@ impl GpuWork {
             free_slots: (0..gpu.max_slots).rev().collect(),
             active_slots: Vec::new(),
             next_item: start,
+            split: Vec::new(),
+            outstanding: vec![0; total as usize],
             done: vec![false; total as usize],
             unfinished: start,
             completed: start,
             node_budget: 1 << 12,
+        }
+    }
+
+    /// Records that one partial ruler of `item` was fully searched (or split).
+    fn finish(&mut self, item: u64) {
+        self.outstanding[item as usize] -= 1;
+        if self.outstanding[item as usize] == 0 {
+            self.done[item as usize] = true;
+            self.completed += 1;
         }
     }
 
@@ -563,23 +583,31 @@ impl GpuWork {
         for &slot in &self.active_slots {
             work.extend([slot, gpu::RESUME]);
         }
-        let mut prefixes = Vec::new();
-        let mut fresh = 0;
-        while self.next_item < total {
-            let Some(slot) = self.free_slots.pop() else { break };
-            self.slot_item[slot as usize] = Some(self.next_item);
+        // Each new partial ruler is its depth followed by its marks.
+        let mut prefixes: Vec<u32> = Vec::new();
+        while !self.free_slots.is_empty() {
+            let (item, marks) = if let Some((item, marks)) = self.split.pop() {
+                (item, marks)
+            } else if self.next_item < total {
+                self.outstanding[self.next_item as usize] = 1;
+                self.next_item += 1;
+                (self.next_item - 1, ctx.prefix(self.next_item - 1).to_vec())
+            } else {
+                break;
+            };
+            let slot = self.free_slots.pop().unwrap();
+            self.slot_item[slot as usize] = Some(item);
             self.active_slots.push(slot);
-            work.extend([slot, fresh]);
-            prefixes.extend(ctx.prefix(self.next_item).iter().map(|&m| m as u32));
-            self.next_item += 1;
-            fresh += 1;
+            work.extend([slot, prefixes.len() as u32]);
+            prefixes.push(marks.len() as u32);
+            prefixes.extend(marks.iter().map(|&m| m as u32));
         }
 
         let params = SearchParams {
             length: length as u32,
             num_segments: n as u32,
             num_work: (work.len() / 2) as u32,
-            prefix_depth: ctx.depth as u32,
+            _padding0: 0,
             words: (length as u32).div_ceil(32),
             max_results: gpu.max_results,
             node_budget: self.node_budget,
@@ -612,15 +640,45 @@ impl GpuWork {
 
         for slot in pass.finished {
             let item = self.slot_item[slot as usize].take().unwrap();
-            self.done[item as usize] = true;
-            self.completed += 1;
+            self.finish(item);
             self.free_slots.push(slot);
         }
         let slot_item = &self.slot_item;
         self.active_slots
             .retain(|&slot| slot_item[slot as usize].is_some());
+
+        if self.next_item == total
+            && self.split.is_empty()
+            && !self.active_slots.is_empty()
+            && self.active_slots.len() <= gpu.max_slots as usize / 8
+        {
+            self.split_active(ctx, gpu)?;
+        }
+
         while self.unfinished < total && self.done[self.unfinished as usize] {
             self.unfinished += 1;
+        }
+        Ok(())
+    }
+
+    /// Replaces the partial ruler in every busy slot with the partial rulers it has left to
+    /// search, and frees the slots.
+    fn split_active(&mut self, ctx: &WorkContext, gpu: &GpuContext) -> Result<(), String> {
+        let states = gpu.read_states(&self.active_slots)?;
+        for (slot, state) in std::mem::take(&mut self.active_slots)
+            .into_iter()
+            .zip(states.chunks(gpu::STATE_STRIDE))
+        {
+            let item = self.slot_item[slot as usize].take().unwrap();
+            let k = state[0] as usize;
+            let pos: Vec<u8> = state[1..=k].iter().map(|&p| p as u8).collect();
+            let root = state[gpu::STATE_STRIDE - 1] as usize;
+            ctx.search.remaining(&pos, root, &state[33..65], |marks| {
+                self.split.push((item, marks.to_vec()));
+                self.outstanding[item as usize] += 1;
+            });
+            self.finish(item);
+            self.free_slots.push(slot);
         }
         Ok(())
     }

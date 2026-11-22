@@ -243,6 +243,30 @@ impl Search {
         (depth, level)
     }
 
+    /// Calls `f` with the marks of each partial ruler left to search by a search that started
+    /// from a partial ruler of `root` marks, has reached the marks `pos`, and tries position
+    /// `next[i]` next for mark `i` (`root <= i <= pos.len()`). Together they cover exactly the
+    /// rest of that search.
+    pub fn remaining(&self, pos: &[u8], root: usize, next: &[u32], mut f: impl FnMut(&[u8])) {
+        let k = pos.len();
+        if k == self.n - 1 {
+            // The last mark is placed all at once, so this node is searched again whole.
+            f(pos);
+        }
+        let mut marks = [0u8; MAX_MARKS];
+        marks[..k].copy_from_slice(pos);
+        for i in root..=k.min(self.n - 2) {
+            let node = self.node_from_marks(&pos[..i]);
+            for p in next[i] as usize..=self.limit(&node, i) {
+                if self.child(&node, p).is_some() {
+                    marks[i] = p as u8;
+                    f(&marks[..=i]);
+                }
+            }
+            marks[i] = pos.get(i).copied().unwrap_or(0);
+        }
+    }
+
     pub fn length(&self) -> usize {
         self.length
     }
@@ -421,6 +445,45 @@ mod tests {
         let mut out = dfs.found;
         out.sort();
         out
+    }
+
+    /// Splitting a search after it descended along its first path, at every depth, leaves
+    /// exactly the rulers of the whole search (nothing before that path was searched).
+    #[test]
+    fn remaining_covers_rest_of_search() {
+        let interrupt = AtomicBool::new(true);
+        let counter = AtomicU64::new(0);
+        for (length, n) in [(24u8, 6u8), (30, 7), (31, 7)] {
+            let s = Search::new(length, n);
+            let mut whole = Dfs::new(&s, &interrupt, &counter);
+            whole.run(&s.root());
+            whole.found.sort();
+            assert!(!whole.found.is_empty());
+
+            // The first path: at each mark, the first position the search descends into.
+            let mut node = s.root();
+            let mut next = [0u32; MAX_MARKS];
+            while node.k < s.n {
+                let k = node.k;
+                next[k] = node.pos[k - 1] as u32 + 1;
+                let mut parts = Vec::new();
+                s.remaining(&node.pos[..k], 2, &next, |m| parts.push(m.to_vec()));
+                let mut split = Dfs::new(&s, &interrupt, &counter);
+                for part in &parts {
+                    split.run(&s.node_from_marks(part));
+                }
+                split.found.sort();
+                assert_eq!(split.found, whole.found, "L={length} n={n} k={k}");
+                if k == s.n - 1 {
+                    break;
+                }
+                let p = (next[k] as usize..=s.limit(&node, k))
+                    .find(|&p| s.child(&node, p).is_some())
+                    .unwrap();
+                next[k] = p as u32 + 1;
+                node = s.child(&node, p).unwrap();
+            }
+        }
     }
 
     #[test]

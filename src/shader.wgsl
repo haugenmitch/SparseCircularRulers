@@ -16,7 +16,7 @@ struct Params {
     length: u32,
     num_segments: u32,
     num_work: u32,
-    prefix_depth: u32,
+    _p1: u32,
     words: u32,
     max_results: u32,
     node_budget: u32,
@@ -24,12 +24,13 @@ struct Params {
 };
 
 const RESUME: u32 = 0xFFFFFFFFu;
-// Saved search state per slot: depth k, then pos[32], then nextp[32].
-const STATE_STRIDE: u32 = 65u;
+// Saved search state per slot: depth k, then pos[32], then nextp[32], then the depth d of
+// the slot's partial ruler.
+const STATE_STRIDE: u32 = 66u;
 
 @group(0) @binding(0) var<uniform> params: Params;
-// Per thread: the slot it works in, and the index of the partial ruler to start there
-// (prefix_depth marks each in `prefixes`) or RESUME to continue the slot's saved search.
+// Per thread: the slot it works in, and the offset in `prefixes` of the partial ruler to start
+// there (its depth, then its marks) or RESUME to continue the slot's saved search.
 @group(0) @binding(1) var<storage, read> work: array<u32>;
 @group(0) @binding(2) var<storage, read> prefixes: array<u32>;
 // Marks of complete rulers, num_segments per ruler.
@@ -195,7 +196,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let l = params.length;
     let n = params.num_segments;
-    let d = params.prefix_depth;
     let full = bits_range(1u, l - 1u);
     let half = bits_range(1u, l / 2u);
     let slot = work[idx * 2u];
@@ -208,13 +208,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var marks: Bits;
     var rev: Bits;
     var k: u32;
+    // Depth of the slot's partial ruler: the search backtracks no further.
+    var d: u32;
 
     if (prefix != RESUME) {
-        for (var i = 0u; i < d; i++) { pos[i] = prefixes[prefix * d + i]; }
+        d = prefixes[prefix];
+        for (var i = 0u; i < d; i++) { pos[i] = prefixes[prefix + 1u + i]; }
         k = d;
         nextp[d] = pos[d - 1u] + 1u;
     } else {
         k = state[base];
+        d = state[base + 65u];
         for (var i = 0u; i < k; i++) { pos[i] = state[base + 1u + i]; }
         for (var i = d; i <= k; i++) { nextp[i] = state[base + 33u + i]; }
     }
@@ -331,6 +335,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         finished[atomicAdd(&counters[3], 1u)] = slot;
     } else {
         state[base] = k;
+        state[base + 65u] = d;
         for (var i = 0u; i < k; i++) { state[base + 1u + i] = pos[i]; }
         for (var i = d; i <= k; i++) { state[base + 33u + i] = nextp[i]; }
     }

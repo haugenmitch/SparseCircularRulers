@@ -11,8 +11,7 @@ pub struct SearchParams {
     pub num_segments: u32,
     /// Number of (slot, prefix) entries in this pass (one GPU thread each).
     pub num_work: u32,
-    /// Marks per partial ruler.
-    pub prefix_depth: u32,
+    pub _padding0: u32,
     /// 32-bit words per bitset.
     pub words: u32,
     pub max_results: u32,
@@ -26,8 +25,9 @@ pub const RESUME: u32 = u32::MAX;
 
 const WORKGROUP_SIZE: u32 = 64;
 const MAX_MARKS: u64 = 32;
-/// u32s of saved search state per slot: depth, then 32 marks, then 32 next positions.
-const STATE_STRIDE: u64 = 1 + 2 * MAX_MARKS;
+/// u32s of saved search state per slot: depth, then 32 marks, then 32 next positions, then
+/// the depth of the slot's partial ruler.
+pub const STATE_STRIDE: usize = 2 + 2 * MAX_MARKS as usize;
 /// Longest a pass may take before the GPU is considered lost.
 const PASS_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -56,6 +56,8 @@ pub struct GpuContext {
     staging_counter: wgpu::Buffer,
     staging_finished: wgpu::Buffer,
     staging_results: wgpu::Buffer,
+    state_buffer: wgpu::Buffer,
+    staging_state: wgpu::Buffer,
     /// Partial rulers searched at once; each keeps its search state in a slot between passes.
     pub max_slots: u32,
     /// Most rulers one pass can return.
@@ -143,7 +145,9 @@ impl GpuContext {
             contents: bytemuck::cast_slice(&[0u32; 4]),
             usage: U::STORAGE | U::COPY_SRC | U::COPY_DST,
         });
-        let state_buffer = buffer("Search State", slots * STATE_STRIDE * 4, U::STORAGE);
+        let state_bytes = slots * STATE_STRIDE as u64 * 4;
+        let state_buffer = buffer("Search State", state_bytes, U::STORAGE | U::COPY_SRC);
+        let staging_state = buffer("Staging State", state_bytes, U::MAP_READ | U::COPY_DST);
         let finished_buffer = buffer("Finished Slots", slots * 4, U::STORAGE | U::COPY_SRC);
         let staging_counter = buffer("Staging Counters", 16, U::MAP_READ | U::COPY_DST);
         let staging_finished = buffer("Staging Finished", slots * 4, U::MAP_READ | U::COPY_DST);
@@ -185,6 +189,8 @@ impl GpuContext {
             staging_counter,
             staging_finished,
             staging_results,
+            state_buffer,
+            staging_state,
             max_slots,
             max_results,
         })
@@ -249,9 +255,28 @@ impl GpuContext {
             .collect())
     }
 
-    /// Runs one pass. `work` holds a (slot, prefix index) pair per thread: the prefix index
-    /// points into `prefixes` (`params.prefix_depth` marks each) for a partial ruler starting
-    /// in that slot, or is `RESUME` to continue the slot's saved search.
+    /// Reads the saved search state of `slots` (`STATE_STRIDE` u32s each, in order).
+    pub fn read_states(&self, slots: &[u32]) -> Result<Vec<u32>, String> {
+        let stride = STATE_STRIDE as u64 * 4;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        for (i, &slot) in slots.iter().enumerate() {
+            encoder.copy_buffer_to_buffer(
+                &self.state_buffer,
+                slot as u64 * stride,
+                &self.staging_state,
+                i as u64 * stride,
+                stride,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(self
+            .read(&[(&self.staging_state, slots.len() as u64 * stride)])?
+            .remove(0))
+    }
+
+    /// Runs one pass. `work` holds a (slot, prefix offset) pair per thread: the offset points
+    /// into `prefixes`, at a partial ruler's depth followed by its marks, for a partial ruler
+    /// starting in that slot, or is `RESUME` to continue the slot's saved search.
     pub fn run_pass(
         &self,
         params: &SearchParams,
