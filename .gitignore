@@ -8,3 +8,8 @@ GEMINI.md
 examples/
 tools/
 *.json
+*.png
+
+# parsed-results cache written by visualizations/ruler_data.py
+visualizations/.cache/
+__pycache__/
