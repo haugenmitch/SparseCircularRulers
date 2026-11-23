@@ -5,9 +5,13 @@
 // checking them here needs per-depth state indexed by each thread's own depth, which cost
 // more GPU time than the nodes they cut saved.
 //
-// WORDS (32-bit words per bitset) and HWORDS are substituted when the pipeline is built, so
-// every bitset loop has a constant bound and unrolls. Words are only ever indexed by constants
-// (`word` picks a runtime index with selects), which keeps the bitsets in registers.
+// WORDS (32-bit words per bitset), HWORDS, and MARKS are substituted when the pipeline is
+// built, so every bitset loop has a constant bound and unrolls. Words are only ever indexed
+// by constants (`word` picks a runtime index with selects), which keeps the bitsets in
+// registers. The per-depth arrays (marks and covered distances) are kept in registers too
+// and indexed by each thread's own depth, which costs code for every entry, so they hold only
+// MARKS (num_segments) entries: sized for 32 marks, the shader used twice the registers and
+// ran about 1.4x slower at length 130.
 //
 // Some forms crash the radv (Mesa 26) shader compiler and are avoided: early returns
 // inside loops, trailing-zero builtins inside loops, clamped constant indices such as
@@ -17,6 +21,8 @@ const WORDS: u32 = __WORDS__u;
 // Words that hold distances up to length / 2, the only ones tracked (measuring d also
 // measures length - d); covered distances are stored per depth in this many words.
 const HWORDS: u32 = __HWORDS__u;
+// Marks per ruler (num_segments): the per-depth arrays hold no more.
+const MARKS: u32 = __MARKS__u;
 
 struct Params {
     length: u32,
@@ -68,6 +74,19 @@ fn word(a: Bits, j: u32) -> u32 {
     var v = 0u;
     for (var t = 0u; t < WORDS; t++) { v = select(v, a[t], t == j); }
     return v;
+}
+
+fn hbits_or(a: HBits, b: HBits) -> HBits {
+    var r: HBits;
+    for (var i = 0u; i < HWORDS; i++) { r[i] = a[i] | b[i]; }
+    return r;
+}
+
+// Bits of `half` not in `c`.
+fn hbits_missing(half: HBits, c: HBits) -> u32 {
+    var n = 0u;
+    for (var i = 0u; i < HWORDS; i++) { n += countOneBits(half[i] & ~c[i]); }
+    return n;
 }
 
 fn bits_or(a: Bits, b: Bits) -> Bits {
@@ -221,10 +240,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let prefix = work[idx * 2u + 1u];
     let base = slot * STATE_STRIDE;
 
-    var pos: array<u32, 32>;
-    var nextp: array<u32, 32>;
+    var pos: array<u32, MARKS>;
+    // Next position to try for mark k (for marks below k it is one past their position).
+    var np: u32;
     // Covered distances at each depth (only those up to l / 2 count).
-    var covs: array<HBits, 32>;
+    var covs: array<HBits, MARKS>;
     var marks: Bits;
     var rev: Bits;
     var k: u32;
@@ -235,12 +255,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         d = prefixes[prefix];
         for (var i = 0u; i < d; i++) { pos[i] = prefixes[prefix + 1u + i]; }
         k = d;
-        nextp[d] = pos[d - 1u] + 1u;
+        np = pos[d - 1u] + 1u;
     } else {
         k = state[base];
         d = state[base + 65u];
         for (var i = 0u; i < k; i++) { pos[i] = state[base + 1u + i]; }
-        for (var i = d; i <= k; i++) { nextp[i] = state[base + 33u + i]; }
+        np = state[base + 33u + k];
     }
 
     // Rebuild the marks and the covered distances at each depth from the marks.
@@ -308,13 +328,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         } else {
-            // Try positions p = nextp[k]..=limit; moving p by one shifts its new distances by one.
-            let ck = widen(covs[k]);
+            // Try positions p = np..=limit; moving p by one shifts its new distances by one.
+            let ck = covs[k];
+            let hhalf = narrow(half);
             let lim = limit(k, pos[2]);
             let k1 = k + 1u;
             let r = n - k1;
             let bound = r * k1 + (r * (r - 1u)) / 2u;
-            var p = nextp[k];
+            var p = np;
             var up: Bits;
             var down: Bits;
             if (p <= lim) {
@@ -325,15 +346,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             loop {
                 if (p > lim) { break; }
                 nodes += 1u;
-                let nc = bits_or(ck, bits_or(up, down));
-                if (bits_count(bits_and_not(half, nc)) <= bound) {
-                    nextp[k] = p + 1u;
+                // Only distances up to l / 2 count, so only those words are compared.
+                let nc = hbits_or(ck, narrow(bits_or(up, down)));
+                if (hbits_missing(hhalf, nc) <= bound) {
                     pos[k] = p;
                     marks = bits_toggle(marks, p);
                     rev = bits_toggle(rev, l - 1u - p);
-                    covs[k1] = narrow(nc);
+                    covs[k1] = nc;
                     k = k1;
-                    nextp[k] = p + 1u;
+                    np = p + 1u;
                     descended = true;
                     break;
                 }
@@ -347,6 +368,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Backtrack.
         if (k == d) { done = true; break; }
         k -= 1u;
+        np = pos[k] + 1u;
         marks = bits_toggle(marks, pos[k]);
         rev = bits_toggle(rev, l - 1u - pos[k]);
     }
@@ -357,7 +379,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state[base] = k;
         state[base + 65u] = d;
         for (var i = 0u; i < k; i++) { state[base + 1u + i] = pos[i]; }
-        for (var i = d; i <= k; i++) { state[base + 33u + i] = nextp[i]; }
+        // The host reads a next position for every mark from d to k.
+        for (var i = d; i < k; i++) { state[base + 33u + i] = pos[i] + 1u; }
+        state[base + 33u + k] = np;
     }
 
     let old = atomicAdd(&counters[1], nodes);
