@@ -1,13 +1,19 @@
 // Backtracking search for complete circular rulers; each thread searches one partial ruler,
 // in steps of at most node_budget nodes per pass.
-// This mirrors `Dfs::run` in search.rs (see there for the pruning rules), except that the
-// rotation and reflection rules are only applied to the partial rulers handed to the GPU:
-// checking them here needs per-depth state indexed by each thread's own depth, which cost
-// more GPU time than the nodes they cut saved.
+// This mirrors `Dfs::run` in search.rs (see there for the pruning rules), except that of the
+// rotation and reflection rules only the first step is applied here (see `lowest`): after a
+// later segment of 1 the next segment is at least s_1, and a new segment of 1 must follow one
+// of at least s_1. The full rules need per-depth state indexed by each thread's own depth,
+// which cost more GPU time than the extra nodes they cut; they prune the partial rulers
+// handed to the GPU instead.
 //
-// WORDS (32-bit words per bitset) and HWORDS are substituted when the pipeline is built, so
-// every bitset loop has a constant bound and unrolls. Words are only ever indexed by constants
-// (`word` picks a runtime index with selects), which keeps the bitsets in registers.
+// WORDS (32-bit words per bitset), HWORDS, and MARKS are substituted when the pipeline is
+// built, so every bitset loop has a constant bound and unrolls. Words are only ever indexed
+// by constants (`word` picks a runtime index with selects), which keeps the bitsets in
+// registers. The per-depth arrays (marks and covered distances) are kept in registers too
+// and indexed by each thread's own depth, which costs code for every entry, so they hold only
+// MARKS (num_segments) entries: sized for 32 marks, the shader used twice the registers and
+// ran about 1.4x slower at length 130.
 //
 // Some forms crash the radv (Mesa 26) shader compiler and are avoided: early returns
 // inside loops, trailing-zero builtins inside loops, clamped constant indices such as
@@ -17,6 +23,8 @@ const WORDS: u32 = __WORDS__u;
 // Words that hold distances up to length / 2, the only ones tracked (measuring d also
 // measures length - d); covered distances are stored per depth in this many words.
 const HWORDS: u32 = __HWORDS__u;
+// Marks per ruler (num_segments): the per-depth arrays hold no more.
+const MARKS: u32 = __MARKS__u;
 
 struct Params {
     length: u32,
@@ -68,6 +76,19 @@ fn word(a: Bits, j: u32) -> u32 {
     var v = 0u;
     for (var t = 0u; t < WORDS; t++) { v = select(v, a[t], t == j); }
     return v;
+}
+
+fn hbits_or(a: HBits, b: HBits) -> HBits {
+    var r: HBits;
+    for (var i = 0u; i < HWORDS; i++) { r[i] = a[i] | b[i]; }
+    return r;
+}
+
+// Bits of `half` not in `c`.
+fn hbits_missing(half: HBits, c: HBits) -> u32 {
+    var n = 0u;
+    for (var i = 0u; i < HWORDS; i++) { n += countOneBits(half[i] & ~c[i]); }
+    return n;
 }
 
 fn bits_or(a: Bits, b: Bits) -> Bits {
@@ -184,7 +205,17 @@ fn measuring(marks: Bits, c: u32) -> Bits {
     return bits_or(bits_shl(marks, c), bits_shl(marks, params.length - c));
 }
 
+// Smallest position for mark k (k >= 2): in a canonical ruler, which starts with s_0 = 1, the
+// rotation starting at a later segment of 1 is no smaller, so the segment after it is at
+// least s_1. This is the first step of the rotation rule in search.rs; it needs no state.
+fn lowest(pos: ptr<function, array<u32, MARKS>>, k: u32) -> u32 {
+    let b = (*pos)[k - 1u];
+    let after_one = k >= 3u && b - (*pos)[k - 2u] == 1u;
+    return b + select(1u, (*pos)[2] - 1u, after_one);
+}
+
 // Largest position allowed for mark j (s_1 <= s_{n-1} and room for later marks).
+
 fn limit(j: u32, pos2: u32) -> u32 {
     let l = params.length;
     let n = params.num_segments;
@@ -221,10 +252,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let prefix = work[idx * 2u + 1u];
     let base = slot * STATE_STRIDE;
 
-    var pos: array<u32, 32>;
-    var nextp: array<u32, 32>;
+    var pos: array<u32, MARKS>;
+    // Next position to try for mark k (for marks below k it is one past their position).
+    var np: u32;
     // Covered distances at each depth (only those up to l / 2 count).
-    var covs: array<HBits, 32>;
+    var covs: array<HBits, MARKS>;
     var marks: Bits;
     var rev: Bits;
     var k: u32;
@@ -235,12 +267,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         d = prefixes[prefix];
         for (var i = 0u; i < d; i++) { pos[i] = prefixes[prefix + 1u + i]; }
         k = d;
-        nextp[d] = pos[d - 1u] + 1u;
+        np = pos[d - 1u] + 1u;
     } else {
         k = state[base];
         d = state[base + 65u];
         for (var i = 0u; i < k; i++) { pos[i] = state[base + 1u + i]; }
-        for (var i = d; i <= k; i++) { nextp[i] = state[base + 33u + i]; }
+        np = state[base + 33u + k];
     }
 
     // Rebuild the marks and the covered distances at each depth from the marks.
@@ -258,9 +290,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     loop {
         if (nodes >= params.node_budget) { break; }
 
+        // The threads of a subgroup run in lockstep, so the last-mark step below costs the
+        // whole subgroup whenever any of its threads takes it, and with 14 segments one
+        // thread in ten does. A thread there waits until at least 1/8 of the subgroup's
+        // threads still searching are there too, so they take it together. Lengths 94 and
+        // 130 (14 segments) run 13-16% faster; 13 segments, where the step is rare, about
+        // the same. (Without subgroup support this block is removed.)
+        // SUBGROUP_BEGIN
+        let at_last = k == n - 1u;
+        let last = subgroupBallot(at_last);
+        let searching = subgroupBallot(true);
+        let waiting = countOneBits(last.x) + countOneBits(last.y);
+        if (at_last && waiting * 8u < countOneBits(searching.x) + countOneBits(searching.y)) {
+            continue;
+        }
+        // SUBGROUP_END
         if (k == n - 1u) {
             // Last mark: only positions that measure the two smallest missing distances.
-            let lo = pos[k - 1u] + 1u;
+            let lo = lowest(&pos, k);
             let hi = limit(k, pos[2]);
             if (lo <= hi) {
                 let missing = bits_and_not(half, widen(covs[k]));
@@ -308,13 +355,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         } else {
-            // Try positions p = nextp[k]..=limit; moving p by one shifts its new distances by one.
-            let ck = widen(covs[k]);
+            // Try positions p = np..=limit; moving p by one shifts its new distances by one.
+            let ck = covs[k];
+            let hhalf = narrow(half);
             let lim = limit(k, pos[2]);
             let k1 = k + 1u;
             let r = n - k1;
             let bound = r * k1 + (r * (r - 1u)) / 2u;
-            var p = nextp[k];
+            // A new segment of 1 starts the reflection 1, s_{k-2}, ..., which is no smaller
+            // than the ruler only if s_{k-2} >= s_1 (the first step of the reflection rule).
+            var p = max(np, lowest(&pos, k));
+            let one = pos[k - 1u] + 1u;
+            let skip_one = k >= 3u && pos[k - 1u] - pos[k - 2u] < pos[2] - 1u;
             var up: Bits;
             var down: Bits;
             if (p <= lim) {
@@ -325,15 +377,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             loop {
                 if (p > lim) { break; }
                 nodes += 1u;
-                let nc = bits_or(ck, bits_or(up, down));
-                if (bits_count(bits_and_not(half, nc)) <= bound) {
-                    nextp[k] = p + 1u;
+                // Only distances up to l / 2 count, so only those words are compared.
+                let nc = hbits_or(ck, narrow(bits_or(up, down)));
+                if (hbits_missing(hhalf, nc) <= bound && !(skip_one && p == one)) {
                     pos[k] = p;
                     marks = bits_toggle(marks, p);
                     rev = bits_toggle(rev, l - 1u - p);
-                    covs[k1] = narrow(nc);
+                    covs[k1] = nc;
                     k = k1;
-                    nextp[k] = p + 1u;
+                    np = p + 1u;
                     descended = true;
                     break;
                 }
@@ -347,6 +399,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Backtrack.
         if (k == d) { done = true; break; }
         k -= 1u;
+        np = pos[k] + 1u;
         marks = bits_toggle(marks, pos[k]);
         rev = bits_toggle(rev, l - 1u - pos[k]);
     }
@@ -357,7 +410,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state[base] = k;
         state[base + 65u] = d;
         for (var i = 0u; i < k; i++) { state[base + 1u + i] = pos[i]; }
-        for (var i = d; i <= k; i++) { state[base + 33u + i] = nextp[i]; }
+        // The host reads a next position for every mark from d to k.
+        for (var i = d; i < k; i++) { state[base + 33u + i] = pos[i] + 1u; }
+        state[base + 33u + k] = np;
     }
 
     let old = atomicAdd(&counters[1], nodes);

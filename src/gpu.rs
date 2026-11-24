@@ -45,8 +45,8 @@ pub struct GpuContext {
     queue: wgpu::Queue,
     pipeline_layout: wgpu::PipelineLayout,
     /// One pipeline per bitset size (`SearchParams::words`, and the words that hold distances
-    /// up to half the length), built on first use.
-    pipelines: Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>,
+    /// up to half the length) and segment count, built on first use.
+    pipelines: Mutex<HashMap<(u32, u32, u32), wgpu::ComputePipeline>>,
     bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
     work_buffer: wgpu::Buffer,
@@ -84,7 +84,7 @@ impl GpuContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Sparse Ruler Compute Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: adapter.features() & wgpu::Features::SUBGROUP,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: Default::default(),
                 },
@@ -197,14 +197,22 @@ impl GpuContext {
         })
     }
 
-    fn pipeline(&self, words: u32, half_words: u32) -> wgpu::ComputePipeline {
+    fn pipeline(&self, words: u32, half_words: u32, marks: u32) -> wgpu::ComputePipeline {
         let mut pipelines = self.pipelines.lock().unwrap();
         pipelines
-            .entry((words, half_words))
+            .entry((words, half_words, marks))
             .or_insert_with(|| {
-                let source = include_str!("shader.wgsl")
+                let mut source = include_str!("shader.wgsl").to_string();
+                // The shader's subgroup block only speeds it up; drop it where unsupported.
+                if !self.device.features().contains(wgpu::Features::SUBGROUP) {
+                    let start = source.find("// SUBGROUP_BEGIN").unwrap();
+                    let end = source.find("// SUBGROUP_END").unwrap();
+                    source.replace_range(start..end, "");
+                }
+                let source = source
                     .replace("__WORDS__", &words.to_string())
-                    .replace("__HWORDS__", &half_words.to_string());
+                    .replace("__HWORDS__", &half_words.to_string())
+                    .replace("__MARKS__", &marks.to_string());
                 let shader = self
                     .device
                     .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -302,7 +310,8 @@ impl GpuContext {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline(params.words, params.length / 2 / 32 + 1));
+            let half_words = params.length / 2 / 32 + 1;
+            pass.set_pipeline(&self.pipeline(params.words, half_words, params.num_segments));
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(params.num_work.div_ceil(WORKGROUP_SIZE), 1, 1);
         }
