@@ -27,8 +27,9 @@
 //!   which is checked against `s_0, s_1, ..., s_t` as soon as it is placed.
 //!
 //! The full `is_canonical` check still runs on complete rulers, for the comparisons
-//! that wrap around past the last segment. The GPU shader applies only `s_1 <= s_{n-1}`;
-//! the other rules prune the partial rulers it is given.
+//! that wrap around past the last segment. The GPU shader applies `s_1 <= s_{n-1}` and only
+//! the first step of the rotation and reflection rules; the full rules prune the partial
+//! rulers it is given.
 
 use crate::is_canonical;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

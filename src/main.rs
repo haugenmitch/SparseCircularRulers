@@ -753,7 +753,7 @@ impl GpuWork {
         }
 
         ctx.eval_counter.fetch_add(pass.nodes, Ordering::Relaxed);
-        // The GPU only applies the s_1 <= s_{n-1} symmetry rule; keep the canonical rulers.
+        // The GPU applies only part of the symmetry rules; keep the canonical rulers.
         let mut found: Vec<Vec<u8>> = pass
             .rulers
             .chunks(n)

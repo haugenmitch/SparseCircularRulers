@@ -84,7 +84,7 @@ impl GpuContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Sparse Ruler Compute Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: adapter.features() & wgpu::Features::SUBGROUP,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: Default::default(),
                 },
@@ -202,7 +202,14 @@ impl GpuContext {
         pipelines
             .entry((words, half_words, marks))
             .or_insert_with(|| {
-                let source = include_str!("shader.wgsl")
+                let mut source = include_str!("shader.wgsl").to_string();
+                // The shader's subgroup block only speeds it up; drop it where unsupported.
+                if !self.device.features().contains(wgpu::Features::SUBGROUP) {
+                    let start = source.find("// SUBGROUP_BEGIN").unwrap();
+                    let end = source.find("// SUBGROUP_END").unwrap();
+                    source.replace_range(start..end, "");
+                }
+                let source = source
                     .replace("__WORDS__", &words.to_string())
                     .replace("__HWORDS__", &half_words.to_string())
                     .replace("__MARKS__", &marks.to_string());
