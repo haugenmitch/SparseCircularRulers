@@ -27,6 +27,7 @@ from generate_plots import apply_style, PALETTE, GRID  # noqa: E402
 
 
 def main():
+    """Plot clock time per length for each file and the speed-up over the first."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("files", nargs="+", help="results JSON files; the first is the baseline")
     p.add_argument("--out", default="plots/timing_comparison.png")

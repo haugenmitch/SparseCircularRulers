@@ -1,39 +1,13 @@
-//! Backtracking search for complete circular rulers.
+//! Backtracking search for complete canonical rulers of one length and segment count.
 //!
-//! A ruler with `n` segments summing to `L` is described by its marks
-//! `0 = m_0 < m_1 < ... < m_{n-1} < L`. Since some segment must be 1 (to measure
-//! distance 1), rotating it to the front fixes `m_0 = 0` and `m_1 = 1`.
-//!
-//! Marks are placed left to right. For every partial ruler we keep a bitset of
-//! the covered cyclic distances; covering `d` always covers `L - d`, so the
-//! distances form `floor(L / 2)` classes. Two pruning rules cut the tree:
-//!
-//! * Counting bound: with `k` marks placed and `r` left, at most
-//!   `r * k + r * (r - 1) / 2` new pairs (and so classes) can still be covered.
-//! * Last mark: the smallest missing distance `c` must be measured from the last
-//!   mark `p`, so `p` is one of `m_i + c` or `m_i + L - c`. Only those (at most
-//!   `2 * (n - 1)`) positions, narrowed further by the next smallest missing
-//!   distance, are checked instead of every position.
-//!
-//! Symmetry rules keep only partial rulers that can still be canonical (the
-//! lexicographically smallest of their rotations and reflections, which start with
-//! a segment of 1):
-//!
-//! * `s_1 <= s_{n-1}`: the ruler must not exceed its reflection about `m_0`.
-//! * Rotations: for each later segment `s_i = 1`, the rotation starting there must not
-//!   be smaller, so while `s_i, s_{i+1}, ...` equals `s_0, s_1, ...` the next segment
-//!   after the run must be at least the corresponding one from the start.
-//! * Reflections: a new segment `s_t = 1` starts a reflection `s_t, s_{t-1}, ..., s_0`,
-//!   which is checked against `s_0, s_1, ..., s_t` as soon as it is placed.
-//!
-//! The full `is_canonical` check still runs on complete rulers, for the comparisons
-//! that wrap around past the last segment. The GPU shader applies `s_1 <= s_{n-1}` and only
-//! the first step of the rotation and reflection rules; the full rules prune the partial
-//! rulers it is given.
+//! Marks are placed left to right from `m_0 = 0, m_1 = 1`, with bitsets for the marks and
+//! the covered distances. ALGORITHM.md (sections 2 to 5) explains the pruning and symmetry
+//! rules and how the search is split into prefixes.
 
-use crate::is_canonical;
+use crate::ruler::is_canonical;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Most marks (segments) a ruler may have.
 pub const MAX_MARKS: usize = 32;
 
 /// A set of `64 * W` bits; bit `i` stands for position or distance `i`.
@@ -47,6 +21,7 @@ impl<const W: usize> Default for Bits<W> {
 }
 
 impl<const W: usize> Bits<W> {
+    /// Sets bit `i`.
     fn set(&mut self, i: usize) {
         self.0[i >> 6] |= 1 << (i & 63);
     }
@@ -70,6 +45,7 @@ impl<const W: usize> Bits<W> {
         r
     }
 
+    /// Shifts toward higher bits.
     fn shl(self, s: usize) -> Self {
         let (w, b) = (s >> 6, s & 63);
         let mut r = [0u64; W];
@@ -83,6 +59,7 @@ impl<const W: usize> Bits<W> {
         Bits(r)
     }
 
+    /// Shifts toward lower bits.
     fn shr(self, s: usize) -> Self {
         let (w, b) = (s >> 6, s & 63);
         let mut r = [0u64; W];
@@ -96,22 +73,27 @@ impl<const W: usize> Bits<W> {
         Bits(r)
     }
 
+    /// Union.
     fn or(self, o: Self) -> Self {
         Bits(std::array::from_fn(|i| self.0[i] | o.0[i]))
     }
 
+    /// Bits not in `o`.
     fn and_not(self, o: Self) -> Self {
         Bits(std::array::from_fn(|i| self.0[i] & !o.0[i]))
     }
 
+    /// Intersection.
     fn and(self, o: Self) -> Self {
         Bits(std::array::from_fn(|i| self.0[i] & o.0[i]))
     }
 
+    /// Number of set bits.
     fn count(self) -> u32 {
         self.0.iter().map(|w| w.count_ones()).sum()
     }
 
+    /// Whether no bit is set.
     fn is_empty(self) -> bool {
         self.0 == [0; W]
     }
@@ -121,10 +103,12 @@ impl<const W: usize> Bits<W> {
         Bits(std::array::from_fn(|i| self.0[i]))
     }
 
+    /// Clears bit `i`.
     fn clear(&mut self, i: usize) {
         self.0[i >> 6] &= !(1 << (i & 63));
     }
 
+    /// The lowest set bit.
     fn lowest(self) -> Option<usize> {
         self.0
             .iter()
@@ -133,6 +117,7 @@ impl<const W: usize> Bits<W> {
             .map(|(i, w)| i * 64 + w.trailing_zeros() as usize)
     }
 
+    /// Calls `f` with each set bit, lowest first.
     fn for_each_one(self, mut f: impl FnMut(usize)) {
         for (i, &w) in self.0.iter().enumerate() {
             let mut w = w;
@@ -165,6 +150,7 @@ pub struct Node<const W: usize, const H: usize> {
 }
 
 impl<const W: usize, const H: usize> Node<W, H> {
+    /// Segment `i`, between marks `i` and `i + 1`.
     fn seg(&self, i: usize) -> usize {
         (self.pos[i + 1] - self.pos[i]) as usize
     }
@@ -179,6 +165,7 @@ pub struct Search<const W: usize = 4, const H: usize = 2> {
 }
 
 impl<const W: usize, const H: usize> Search<W, H> {
+    /// The search for rulers of `length` with `num_segments` segments.
     pub fn new(length: u8, num_segments: u8) -> Self {
         let length = length as usize;
         assert!(length >= 2 && (2..=MAX_MARKS).contains(&(num_segments as usize)));
@@ -247,6 +234,7 @@ impl<const W: usize, const H: usize> Search<W, H> {
         Some(tied)
     }
 
+    /// `node` with a mark at `p`, given the covered distances that result.
     fn place(&self, node: &Node<W, H>, p: usize, cov: Bits<H>) -> Node<W, H> {
         let mut child = *node;
         child.pos[node.k] = p as u8;
@@ -293,6 +281,7 @@ impl<const W: usize, const H: usize> Search<W, H> {
         }
     }
 
+    /// The partial ruler with marks 0 and 1, where every search starts.
     pub fn root(&self) -> Node<W, H> {
         let mut node = Node {
             pos: [0; MAX_MARKS],
@@ -308,6 +297,7 @@ impl<const W: usize, const H: usize> Search<W, H> {
         self.place(&node, 1, cov)
     }
 
+    /// The partial ruler with `marks` (starting 0, 1).
     pub fn node_from_marks(&self, marks: &[u8]) -> Node<W, H> {
         let mut node = self.root();
         for &p in &marks[2..] {
@@ -366,14 +356,17 @@ impl<const W: usize, const H: usize> Search<W, H> {
         }
     }
 
+    /// The ruler length.
     pub fn length(&self) -> usize {
         self.length
     }
 
+    /// The segment count.
     pub fn num_segments(&self) -> usize {
         self.n
     }
 
+    /// The segments of a complete ruler with marks `pos`.
     pub fn segments(&self, pos: &[u8]) -> Vec<u8> {
         let mut segs: Vec<u8> = pos.windows(2).map(|w| w[1] - w[0]).collect();
         segs.push((self.length - *pos.last().unwrap() as usize) as u8);
@@ -384,23 +377,26 @@ impl<const W: usize, const H: usize> Search<W, H> {
 /// Explores every completion of a partial ruler, collecting complete canonical rulers.
 pub struct Dfs<'a, const W: usize, const H: usize> {
     pub search: &'a Search<W, H>,
-    pub interrupt: &'a AtomicBool,
+    /// Cleared to stop the search.
+    pub running: &'a AtomicBool,
     pub eval_counter: &'a AtomicU64,
     pub found: Vec<Vec<u8>>,
+    /// Whether the search stopped before finishing.
     pub interrupted: bool,
     nodes: u64,
     flushed: u64,
 }
 
 impl<'a, const W: usize, const H: usize> Dfs<'a, W, H> {
+    /// A search that adds its node count to `eval_counter`.
     pub fn new(
         search: &'a Search<W, H>,
-        interrupt: &'a AtomicBool,
+        running: &'a AtomicBool,
         eval_counter: &'a AtomicU64,
     ) -> Self {
         Dfs {
             search,
-            interrupt,
+            running,
             eval_counter,
             found: Vec::new(),
             interrupted: false,
@@ -409,23 +405,26 @@ impl<'a, const W: usize, const H: usize> Dfs<'a, W, H> {
         }
     }
 
+    /// Adds the nodes visited since the last flush to `eval_counter`.
     pub fn flush(&mut self) {
         self.eval_counter
             .fetch_add(self.nodes - self.flushed, Ordering::Relaxed);
         self.flushed = self.nodes;
     }
 
+    /// Counts a node; every 65,536 nodes, flushes and checks whether to stop.
     #[inline]
     fn tick(&mut self) {
         self.nodes += 1;
         if self.nodes & 0xFFFF == 0 {
             self.flush();
-            if !self.interrupt.load(Ordering::Relaxed) {
+            if !self.running.load(Ordering::Relaxed) {
                 self.interrupted = true;
             }
         }
     }
 
+    /// Keeps the complete ruler with marks `pos` if it is canonical.
     fn emit(&mut self, pos: &[u8]) {
         let ruler = self.search.segments(pos);
         if is_canonical(&ruler) {
@@ -433,6 +432,7 @@ impl<'a, const W: usize, const H: usize> Dfs<'a, W, H> {
         }
     }
 
+    /// Searches every completion of `node`.
     pub fn run(&mut self, node: &Node<W, H>) {
         let s = self.search;
         let k = node.k;
@@ -465,10 +465,7 @@ impl<'a, const W: usize, const H: usize> Dfs<'a, W, H> {
                 self.nodes += 1;
                 if missing.and_not(s.new_distances(node, p).low()).is_empty() {
                     pos[k] = p as u8;
-                    let ruler = s.segments(&pos[..=k]);
-                    if is_canonical(&ruler) {
-                        self.found.push(ruler);
-                    }
+                    self.emit(&pos[..=k]);
                 }
             });
             return;
@@ -534,16 +531,17 @@ mod tests {
         out
     }
 
+    /// Every ruler the search finds, splitting it into about `target` prefixes.
     fn search_all<const W: usize, const H: usize>(
         length: u8,
         n: u8,
         target: usize,
     ) -> Vec<Vec<u8>> {
         let s = Search::<W, H>::new(length, n);
-        let interrupt = AtomicBool::new(true);
+        let running = AtomicBool::new(true);
         let counter = AtomicU64::new(0);
         let (depth, prefixes) = s.prefixes(target, n as usize - 1, usize::MAX);
-        let mut dfs = Dfs::new(&s, &interrupt, &counter);
+        let mut dfs = Dfs::new(&s, &running, &counter);
         for p in prefixes.chunks(depth) {
             dfs.run(&s.node_from_marks(p));
         }
@@ -556,11 +554,11 @@ mod tests {
     /// exactly the rulers of the whole search (nothing before that path was searched).
     #[test]
     fn remaining_covers_rest_of_search() {
-        let interrupt = AtomicBool::new(true);
+        let running = AtomicBool::new(true);
         let counter = AtomicU64::new(0);
         for (length, n) in [(24u8, 6u8), (30, 7), (31, 7)] {
             let s = <Search>::new(length, n);
-            let mut whole = Dfs::new(&s, &interrupt, &counter);
+            let mut whole = Dfs::new(&s, &running, &counter);
             whole.run(&s.root());
             whole.found.sort();
             assert!(!whole.found.is_empty());
@@ -573,7 +571,7 @@ mod tests {
                 next[k] = node.pos[k - 1] as u32 + 1;
                 let mut parts = Vec::new();
                 s.remaining(&node.pos[..k], 2, &next, |m| parts.push(m.to_vec()));
-                let mut split = Dfs::new(&s, &interrupt, &counter);
+                let mut split = Dfs::new(&s, &running, &counter);
                 for part in &parts {
                     split.run(&s.node_from_marks(part));
                 }
@@ -601,9 +599,9 @@ mod tests {
         for &seg in &ruler[..29] {
             marks.push(marks.last().unwrap() + seg);
         }
-        let interrupt = AtomicBool::new(true);
+        let running = AtomicBool::new(true);
         let counter = AtomicU64::new(0);
-        let mut dfs = Dfs::new(&s, &interrupt, &counter);
+        let mut dfs = Dfs::new(&s, &running, &counter);
         dfs.run(&s.node_from_marks(&marks[..26]));
         assert!(dfs.found.contains(&ruler));
     }
@@ -614,7 +612,7 @@ mod tests {
         // solutions and exercises the slack in the counting bound), with and without
         // splitting the search into prefixes.
         for length in 2..=30u8 {
-            let lb = crate::get_num_segments_lower_bound(length).max(2);
+            let lb = crate::ruler::num_segments_lower_bound(length).max(2);
             for n in lb..=(lb + 1).min(length) {
                 let expected = brute_force(length, n);
                 assert_eq!(

@@ -1,23 +1,27 @@
+//! GPU search through wgpu: buffers, pipelines, passes, and reading results and saved search
+//! states back. The search itself is in shader.wgsl.
+
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
+/// The shader's `Params` uniform.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct SearchParams {
-    pub length: u32,
-    pub num_segments: u32,
+struct SearchParams {
+    length: u32,
+    num_segments: u32,
     /// Number of (slot, prefix) entries in this pass (one GPU thread each).
-    pub num_work: u32,
-    pub _padding0: u32,
+    num_work: u32,
+    _padding0: u32,
     /// 32-bit words per bitset.
-    pub words: u32,
-    pub max_results: u32,
+    words: u32,
+    max_results: u32,
     /// Search nodes each thread may visit before it saves its state and stops for this pass.
-    pub node_budget: u32,
-    pub _padding: u32,
+    node_budget: u32,
+    _padding: u32,
 }
 
 /// Marks the work entry of a slot that resumes its saved state instead of starting a prefix.
@@ -25,11 +29,31 @@ pub const RESUME: u32 = u32::MAX;
 
 const WORKGROUP_SIZE: u32 = 64;
 const MAX_MARKS: u64 = 32;
-/// u32s of saved search state per slot: depth, then 32 marks, then 32 next positions, then
-/// the depth of the slot's partial ruler.
+/// u32s of saved search state per slot (see `SlotState`).
 pub const STATE_STRIDE: usize = 2 + 2 * MAX_MARKS as usize;
 /// Longest a pass may take before the GPU is considered lost.
 const PASS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A slot's saved search state: depth `k`, then 32 marks, then 32 next positions, then the
+/// depth of the slot's prefix.
+pub struct SlotState<'a>(pub &'a [u32]);
+
+impl SlotState<'_> {
+    /// The marks placed so far.
+    pub fn pos(&self) -> &[u32] {
+        &self.0[1..=self.0[0] as usize]
+    }
+
+    /// The next position to try for each mark.
+    pub fn next(&self) -> &[u32] {
+        &self.0[1 + MAX_MARKS as usize..1 + 2 * MAX_MARKS as usize]
+    }
+
+    /// The depth of the prefix the slot started from.
+    pub fn root(&self) -> usize {
+        self.0[STATE_STRIDE - 1] as usize
+    }
+}
 
 /// What one pass returned.
 pub struct Pass {
@@ -40,6 +64,7 @@ pub struct Pass {
     pub nodes: u64,
 }
 
+/// The GPU device, the search's buffers, and its pipelines.
 pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -66,6 +91,7 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
+    /// Opens the most powerful GPU, or `None` if there is none.
     pub async fn new(max_slots: u32, max_results: u32) -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -197,6 +223,7 @@ impl GpuContext {
         })
     }
 
+    /// The pipeline for one bitset size and segment count, built on first use.
     fn pipeline(&self, words: u32, half_words: u32, marks: u32) -> wgpu::ComputePipeline {
         let mut pipelines = self.pipelines.lock().unwrap();
         pipelines
@@ -288,16 +315,28 @@ impl GpuContext {
     }
 
     /// Runs one pass. `work` holds a (slot, prefix offset) pair per thread: the offset points
-    /// into `prefixes`, at a partial ruler's depth followed by its marks, for a partial ruler
-    /// starting in that slot, or is `RESUME` to continue the slot's saved search.
+    /// into `prefixes`, at a prefix's depth followed by its marks, for a prefix starting in
+    /// that slot, or is `RESUME` to continue the slot's saved search.
     pub fn run_pass(
         &self,
-        params: &SearchParams,
+        length: u32,
+        num_segments: u32,
+        node_budget: u32,
         work: &[u32],
         prefixes: &[u32],
     ) -> Result<Pass, String> {
+        let params = SearchParams {
+            length,
+            num_segments,
+            num_work: (work.len() / 2) as u32,
+            _padding0: 0,
+            words: length.div_ceil(32),
+            max_results: self.max_results,
+            node_budget,
+            _padding: 0,
+        };
         self.queue
-            .write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[*params]));
+            .write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[params]));
         self.queue
             .write_buffer(&self.work_buffer, 0, bytemuck::cast_slice(work));
         if !prefixes.is_empty() {

@@ -64,6 +64,7 @@ MCH_STYLE = {
 
 
 def apply_style() -> None:
+    """Use the mch matplotlib style, or the built-in copy of it."""
     home = os.path.expanduser("~")
     candidates = [
         os.environ.get("MCH_STYLE", ""),
@@ -107,6 +108,7 @@ def stacked(heights, figsize):
 
 
 def fmt_ruler(row) -> str:
+    """A ruler as text, like [1, 2, 3]."""
     return "[" + ", ".join(str(int(v)) for v in row) + "]"
 
 
@@ -141,6 +143,7 @@ class LengthStats:
     forced_hist: np.ndarray = None      # boundaries forced c times
 
     def merge(self, other: "LengthStats") -> None:
+        """Add another chunk's statistics to these."""
         self.n += other.n
         self.used += other.used
         self.largest_min = min(self.largest_min, other.largest_min)
@@ -152,6 +155,7 @@ class LengthStats:
 
 
 def chunk_stats(task: tuple[int, int, int]) -> LengthStats:
+    """Statistics for rulers start:stop of one length."""
     L, start, stop = task
     res = RESULTS.lengths[L]
     rulers = res.rulers[start:stop]
@@ -206,6 +210,7 @@ def link_task(L: int) -> tuple[int, dict, int]:
 
 @dataclass
 class Summary:
+    """Every length's merged statistics, links, and counts."""
     lengths: list[int]
     stats: dict[int, LengthStats]
     links: dict[int, dict]
@@ -215,6 +220,7 @@ class Summary:
 
 
 def analyse(results: rd.Results, lengths: list[int], pool, chunk: int) -> Summary:
+    """Compute statistics and one-edit links for `lengths` in the pool."""
     tasks = []
     for L in lengths:
         n = results.lengths[L].count
@@ -245,6 +251,7 @@ def analyse(results: rd.Results, lengths: list[int], pool, chunk: int) -> Summar
 # ---------------------------------------------------------------------------
 
 def save(fig, name: str) -> str:
+    """Save a figure to the output directory and close it."""
     path = os.path.join(ARGS.outdir, name)
     fig.savefig(path, dpi=ARGS.dpi)
     plt.close(fig)
@@ -270,6 +277,7 @@ def isolated(S: Summary) -> list[int]:
 
 
 def fig_segments_vs_length():
+    """Minimal k against the lower bound, and slack."""
     S = SUMMARY
     Ls = np.array(S.lengths)
     ks = np.array([S.k[L] for L in Ls])
@@ -297,6 +305,7 @@ def fig_segments_vs_length():
 
 
 def fig_solutions_vs_length():
+    """Solutions per length, joined along each k plateau."""
     S = SUMMARY
     fig, ax = plt.subplots(figsize=(12, 6.5))
     by_k = defaultdict(list)
@@ -332,6 +341,7 @@ def pair_slack(k: int, L: int) -> int:
 
 
 def fig_solutions_vs_slack():
+    """Solutions against spare arc pairs, by k and parity."""
     S = SUMMARY
     fig, ax = plt.subplots(figsize=(11, 6.5))
     by_k = defaultdict(list)
@@ -365,6 +375,7 @@ def fig_solutions_vs_slack():
 
 
 def fig_count_pairs():
+    """Count ratios of neighbouring lengths, and distance classes against arc pairs."""
     S = SUMMARY
     Ls = [L for L in S.lengths if L - 1 in S.counts and L > 2]
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 9.5), sharex=True,
@@ -407,6 +418,7 @@ def fig_count_pairs():
 
 
 def fig_segment_value_range():
+    """Range of the largest segment per length."""
     S = SUMMARY
     Ls = np.array(S.lengths)
     lo = np.array([S.stats[L].largest_min for L in Ls])
@@ -427,6 +439,7 @@ def fig_segment_value_range():
 
 
 def fig_segment_frequency_heatmap():
+    """Segments of each value per solution, per length."""
     S = SUMMARY
     Ls = S.lengths
     vmax = max(int(np.nonzero(S.stats[L].seg_hist)[0].max()) for L in Ls)
@@ -451,6 +464,7 @@ def fig_segment_frequency_heatmap():
 
 
 def fig_segment_structure():
+    """Unit segments per solution, and solutions per segment multiset."""
     S = SUMMARY
     Ls = S.lengths
     kmax = max(S.k.values())
@@ -477,12 +491,14 @@ def fig_segment_structure():
 
 
 def adjacency_matrix(L: int) -> np.ndarray:
+    """Neighbour pair counts at L, for values 1 up to the largest segment."""
     adj = SUMMARY.stats[L].adjacency
     vmax = int(np.nonzero(SUMMARY.stats[L].seg_hist)[0].max())
     return adj[1: vmax + 1, 1: vmax + 1]
 
 
 def fig_adjacency_by_length():
+    """Neighbour pair matrices for a spread of lengths."""
     S = SUMMARY
     picks = ARGS.adjacency_lengths or pick_lengths(S, 12)
     picks = [L for L in picks if L in S.stats and S.k[L] > 1]
@@ -515,6 +531,7 @@ def fig_adjacency_by_length():
 
 
 def fig_adjacency_focus(L: int):
+    """Neighbour pairs and conditional neighbours at one length."""
     S = SUMMARY
     m = adjacency_matrix(L).astype(float)
     n = m.shape[0]
@@ -546,12 +563,14 @@ def fig_adjacency_focus(L: int):
 
 
 def pick_lengths(S: Summary, count: int) -> list[int]:
+    """About `count` lengths (k >= 4) spread evenly over the range."""
     usable = [L for L in S.lengths if S.k[L] >= 4]
     idx = np.linspace(0, len(usable) - 1, count).round().astype(int)
     return sorted({usable[i] for i in idx})
 
 
 def fig_relations_by_length():
+    """Share of solutions with a one-edit parent or child."""
     S = SUMMARY
     Ls = [L for L in S.lengths if L > 1]
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(12, 8.5), sharex=True)
@@ -588,6 +607,7 @@ def families(S: Summary):
     parent = np.arange(total)
 
     def find(x):
+        """Union-find root of x, compressing the path."""
         root = x
         while parent[root] != root:
             root = parent[root]
@@ -623,6 +643,7 @@ def families(S: Summary):
 
 
 def fig_solution_families():
+    """Family spans and the 30 longest families."""
     S = SUMMARY
     fams, singletons, offsets = families(S)
     spans = np.array([f["lmax"] - f["lmin"] + 1 for f in fams])
@@ -655,6 +676,7 @@ def fig_solution_families():
 
 
 def fig_lineage_small():
+    """Every small solution and its one-edit links."""
     S = SUMMARY
     maxL = ARGS.lineage_max
     Ls = [L for L in S.lengths if L <= maxL]
@@ -697,10 +719,12 @@ def fig_lineage_small():
 
 
 def example_ruler(L: int) -> np.ndarray:
+    """The first (smallest) solution at L."""
     return RESULTS.lengths[L].rulers[0]
 
 
 def fig_involvement_focus(L: int):
+    """Segment involvement for one solution and for all solutions at L."""
     res = RESULTS.lengths[L]
     k = res.num_segments
     ruler = example_ruler(L)
@@ -757,6 +781,7 @@ def fig_involvement_focus(L: int):
 
 
 def fig_involvement_vs_length():
+    """Involvement against relative segment size, grouped by k."""
     S = SUMMARY
     centers = (REL_BINS[:-1] + REL_BINS[1:]) / 2
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(16, 6.5), sharex=True)
@@ -786,6 +811,7 @@ def fig_involvement_vs_length():
 
 
 def fig_boundary_focus(L: int):
+    """Crossings per boundary for the least-forced solution at L."""
     res = RESULTS.lengths[L]
     k = res.num_segments
     # Show the solution that comes closest to having a never-forced boundary.
@@ -843,6 +869,7 @@ def fig_boundary_focus(L: int):
 
 
 def fig_boundary_vs_length():
+    """Forced crossings at the least-crossed boundary, per length."""
     S = SUMMARY
     Ls = np.array([L for L in S.lengths if S.k[L] >= 2])
     lo, med, hi, zero, used = [], [], [], [], []
@@ -881,6 +908,7 @@ def fig_boundary_vs_length():
 
 
 def fig_distance_redundancy():
+    """Extra arc pairs per distance, and the share spent on small distances."""
     S = SUMMARY
     Ls = S.lengths
     dmax = max(Ls) // 2
@@ -919,6 +947,7 @@ def fig_distance_redundancy():
 
 
 def fig_polar_rulers():
+    """The first solution of each length as a ring."""
     S = SUMMARY
     fig = plt.figure(figsize=(12, 12))
     ax = fig.add_subplot(111, projection="polar")
@@ -943,6 +972,7 @@ def fig_polar_rulers():
 
 
 def fig_search_performance():
+    """Time, work, throughput, and hit rate per length."""
     rows = [RESULTS.lengths[L] for L in SUMMARY.lengths]
     Ls = np.array([r.length for r in rows])
     clock = np.array([r.clock_time for r in rows])
@@ -995,6 +1025,7 @@ GROUPS = {
 
 
 def run_figure(job):
+    """Draw one figure; returns its path and the seconds it took."""
     func, arg = job
     t = time.time()
     path = func(arg) if arg is not None else func()
@@ -1002,6 +1033,7 @@ def run_figure(job):
 
 
 def main():
+    """Parse arguments, analyse the results, and draw the requested figures."""
     global RESULTS, SUMMARY, ARGS
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("filename", help="results JSON written by the search")

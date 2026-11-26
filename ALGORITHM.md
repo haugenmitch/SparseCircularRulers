@@ -1,158 +1,160 @@
 # Algorithm
 
-This document describes how the program finds every minimal complete circular sparse ruler for each length, the tricks that make the search fast, and how the work is split across CPU threads and the GPU. See the [README](README.md) for the definitions.
+How the program finds every minimal complete circular ruler of each length, and what makes it fast. Definitions are in the [README](README.md).
 
-Source map:
-
-- `src/search.rs`: the backtracking search (`Search`, `Dfs`), pruning, symmetry rules, and work splitting.
-- `src/shader.wgsl`: the same search on the GPU.
-- `src/gpu.rs`: GPU buffers, passes, and reading results and saved search states back.
-- `src/main.rs`: the outer loop over lengths, the segment-count lower bound, `is_canonical`, CPU and GPU scheduling, and checkpoints.
+| Section | Code |
+| --- | --- |
+| 1. Outer loop and lower bound | `main.rs`, `ruler.rs` |
+| 2–4. Representation, search, symmetry | `search.rs` (`Search`, `Dfs`), `ruler.rs` (`is_canonical`) |
+| 5–6. Splitting and CPU scheduling | `search.rs` (`prefixes`), `length.rs` |
+| 7. GPU search | `shader.wgsl`, `gpu.rs`, `length.rs` (`GpuSlots`) |
+| 8. Checkpoints | `length.rs`, `state.rs` |
 
 ## 1. Outer loop
 
-For each length $L$ (from `--start` to `--end`), the program searches with $n$ segments, starting at a lower bound on $n$. If no complete ruler exists, it tries $n + 1$, and so on. The first $n$ that gives any ruler is the minimum, and every canonical ruler with that $n$ is saved.
+For each length $L$, search with $n$ segments starting at a lower bound. If no ruler exists, try $n + 1$. The first $n$ with any ruler is the minimum; all its canonical rulers are saved.
 
-### Lower bound on the segment count
+### Lower bound
 
-A ruler with $n$ marks has $n(n-1)$ ordered pairs of marks, so it measures at most $n(n-1)$ nonzero cyclic distances. All $L - 1$ distances have to be measured, so
+$n$ marks form $n(n-1)$ ordered pairs, so they measure at most $n(n-1)$ nonzero distances. All $L - 1$ must be measured:
 
 $$n^2 - n + 1 \ge L \quad\Longrightarrow\quad n \ge \left\lceil \frac{\sqrt{4L - 3} + 1}{2} \right\rceil.$$
 
-(`get_num_segments_lower_bound`.)
+### Lengths that cannot meet it
 
-### Lengths that cannot meet the bound
-
-When $L = n^2 - n + 1$ exactly, a ruler with $n$ segments measures every distance exactly once: it is a perfect cyclic difference set of order $q = n - 1$. Such sets are known to exist only when $q$ is a prime power. Bruck–Ryser–Chowla rules out some orders, and a computer search has ruled out every other non-prime-power order below about $2 \cdot 10^9$. So for orders such as 6, 10, 12, and 14 (lengths 43, 111, 157, 211), the search starts at $n + 1$ and skips a search that is known to find nothing.
+When $L = n^2 - n + 1$, a ruler with $n$ segments measures every distance exactly once: a perfect cyclic difference set of order $q = n - 1$. These exist only for prime-power $q$ (Bruck–Ryser–Chowla rules out some orders; a computer search rules out every other order below about $2 \cdot 10^9$). So for $q$ = 6, 10, 12, 14 (lengths 43, 111, 157, 211) the search starts at $n + 1$.
 
 ## 2. Representation
 
-A ruler is a cyclic sequence of segments $s_0, \dots, s_{n-1}$ summing to $L$. The search works with the marks instead: $m_0 = 0$ and $m_i = s_0 + \dots + s_{i-1}$, so $0 = m_0 < m_1 < \dots < m_{n-1} < L$. A cyclic distance $d$ is measured when $m_j - m_i \equiv d \pmod L$ for some pair of marks.
+The search works with marks $0 = m_0 < m_1 < \dots < m_{n-1} < L$, where $m_i = s_0 + \dots + s_{i-1}$. Distance $d$ is measured when $m_j - m_i \equiv d \pmod L$.
 
-**Fixing $s_0 = 1$.** Distance 1 can only be measured by a single segment of length 1, so every complete ruler (with $L \ge 2$) has a segment of 1. Rotating the ruler so that segment comes first loses nothing, so the search always starts with $m_0 = 0, m_1 = 1$. This also matches the canonical form (section 4): 1 is the smallest possible segment, so the lexicographically smallest rotation or reflection always starts with 1.
+- **$s_0 = 1$.** Only a segment of 1 measures distance 1, so every complete ruler has one. Rotating it to the front fixes $m_0 = 0, m_1 = 1$, and matches the canonical form (which starts with its smallest segment).
+- **Half the distances.** Measuring $d$ also measures $L - d$, so only $1..\lfloor L/2 \rfloor$ are tracked.
 
-**Half the distances.** Measuring $d$ also measures $L - d$ (the same pair in the other direction), so the $L - 1$ distances form $\lfloor L/2 \rfloor$ classes $\{d, L - d\}$. Only distances $1..\lfloor L/2 \rfloor$ are tracked; the ruler is complete when they are all covered.
+## 3. Backtracking search
 
-## 3. The backtracking search
+`Dfs::run` places marks left to right. A partial ruler (`Node`) holds:
 
-`Dfs::run` places marks left to right. Each partial ruler (`Node`) holds:
+- `pos`: the marks placed so far ($k$ of them);
+- `marks`: bit $m$ for each mark;
+- `rev`: bit $L - 1 - m$ for each mark;
+- `cov`: covered distances up to $\lfloor L/2 \rfloor$;
+- `tied`: rotations still tied with the start (section 4).
 
-- `pos`: the marks placed so far ($k$ of them).
-- `marks`: a bitset with bit $m$ set for each mark $m$.
-- `rev`: a bitset with bit $L - 1 - m$ set for each mark $m$ (the marks reflected).
-- `cov`: the covered distances up to $\lfloor L/2 \rfloor$.
-- `tied`: rotations still tied with the start of the ruler (section 4).
+### New distances in two shifts
 
-### Computing new distances with two shifts
+A new mark $p$, after every placed mark $m$, measures $p - m$ and $L - (p - m)$:
 
-A new mark $p$ lies after every placed mark, so it measures $p - m$ and $L - (p - m)$ for each mark $m$. Both sets come from one shift each:
+- `rev >> (L - 1 - p)` moves bit $L - 1 - m$ to $p - m$;
+- `marks << (L - p)` moves bit $m$ to $L - (p - m)$.
 
-- `rev >> (L - 1 - p)` moves bit $L - 1 - m$ to bit $p - m$.
-- `marks << (L - p)` moves bit $m$ to bit $L - p + m = L - (p - m)$.
+OR-ing both into `cov` updates the covered distances in a few word operations. Moving the candidate from $p$ to $p + 1$ shifts the two halves by one bit each (`up <<= 1`, `down >>= 1`) instead of recomputing them.
 
-Their union contains, for each mark, whichever of the pair falls at or below $L/2$, so OR-ing it into `cov` (keeping only the low words) updates the covered classes in a handful of word operations, with no loop over marks.
+### Pruning 1: counting bound
 
-**Sliding to the next position.** Moving the candidate from $p$ to $p + 1$ lengthens every $p - m$ by one and shortens every $L - (p - m)$ by one, so the loop over candidate positions shifts the two halves by one bit (`up <<= 1`, `down >>= 1`) instead of recomputing them.
+With $k$ marks placed and $r = n - k$ left, at most $rk + r(r-1)/2$ new pairs can be formed, each covering at most one new distance. A child is dropped when
 
-### Pruning rule 1: counting bound
+$$\text{missing} > rk + \frac{r(r-1)}{2},$$
 
-With $k$ marks placed and $r = n - k$ left, the remaining marks form at most $rk$ pairs with the placed marks and $r(r-1)/2$ pairs among themselves. Each pair covers at most one new class, so a child is dropped when
+with missing distances counted by `popcount` on `half & !cov`.
 
-$$\text{missing classes} > rk + \frac{r(r-1)}{2}.$$
+### Pruning 2: the last mark directly
 
-Missing classes are counted with `popcount` on `half & !cov`.
-
-### Pruning rule 2: placing the last mark directly
-
-When one mark is left, it has to measure every missing distance. Let $c$ be the smallest missing distance. The last mark $p$ measures $c$ only if $p = m + c$ or $p = m + L - c$ for some placed mark $m$, so the candidate positions are
+The last mark must measure the smallest missing distance $c$, so it lies at $m + c$ or $m + L - c$ for some mark $m$:
 
 `(marks << c) | (marks << (L - c))`
 
-intersected with the allowed range. The same is done for the second smallest missing distance, and only the few positions left (out of up to $L$) are checked in full. This replaces the innermost loop of the search, where most nodes are.
+Intersecting this with the same set for the second smallest missing distance leaves a few candidates out of up to $L$, which are checked in full. This replaces the innermost loop, where most nodes are.
 
-### Pruning rule 3: range limits from symmetry
+### Pruning 3: range limits
 
-`Search::limit` bounds each mark from above using $s_1 \le s_{n-1}$ (the ruler must not be larger than its reflection about $m_0$, see section 4) and leaving room for the marks after it:
+`Search::limit` bounds each mark from above using $s_1 \le s_{n-1}$ (section 4) and room for later marks:
 
-- Mark 2: $s_1 = m_2 - 1$, and the last mark is at least $m_2 + n - 3$ and at most $L - s_1$, so $m_2 \le \lfloor (L + 4 - n)/2 \rfloor$.
-- Mark $j > 2$: $m_j \le L - s_1 - (n - 1 - j)$.
+- mark 2: $m_2 \le \lfloor (L + 4 - n)/2 \rfloor$;
+- mark $j > 2$: $m_j \le L - s_1 - (n - 1 - j)$.
 
-`Search::lowest` bounds each mark from below using the rotation rule in section 4.
+`Search::lowest` bounds each mark from below with the rotation rule.
 
 ## 4. Symmetry breaking
 
-A circular ruler has up to $2n$ representations ($n$ rotations, each read in two directions). Only the canonical one, the lexicographically smallest, is kept. `is_canonical` (in `main.rs`) checks this on complete rulers: since the ruler starts with 1, it only compares against rotations and reflections that also start at a segment of 1.
+A circular ruler has up to $2n$ representations. Only the lexicographically smallest is kept. `is_canonical` checks complete rulers, comparing only against rotations and reflections that start at a segment of 1.
 
-Checking only complete rulers would still search up to $2n$ copies of every ruler, so the search also rejects partial rulers that can no longer be canonical:
+To avoid searching up to $2n$ copies, partial rulers that can no longer be canonical are dropped:
 
-- **Reflection about the start:** $s_1 \le s_{n-1}$, enforced through the range limits above.
-- **Rotations:** when a later segment $s_i = 1$ is placed, the rotation starting there is "tied" with the ruler so far. While it stays tied ($s_i, s_{i+1}, \dots$ equals $s_0, s_1, \dots$), each new segment must be at least the corresponding segment from the start, or that rotation would be smaller. The tied rotations are a bitmask (`tied`), and the largest required segment gives the lowest position for the next mark (`lowest`). A rotation leaves the mask once its segment is larger.
-- **Reflections at new 1s:** when a new segment $s_t = 1$ is placed, the reflection $s_t, s_{t-1}, \dots, s_0$ is compared with $s_0, s_1, \dots, s_t$ right away; if it is smaller, the partial ruler is dropped.
+- **Reflection about the start:** $s_1 \le s_{n-1}$, through the range limits.
+- **Rotations:** when a later segment $s_i = 1$ is placed, its rotation is *tied* with the ruler. While $s_i, s_{i+1}, \dots$ equals $s_0, s_1, \dots$, each new segment must be at least the matching one from the start. Tied rotations are a bitmask (`tied`); one leaves it once its segment is larger.
+- **Reflections at new 1s:** when $s_t = 1$ is placed, $s_t, s_{t-1}, \dots, s_0$ is compared with $s_0, \dots, s_t$ at once.
 
-These rules only compare segments that are already placed. Comparisons that wrap around past the last segment need the whole ruler, so `is_canonical` still runs on every complete ruler. On the CPU the rules visit about 20% fewer nodes.
+Comparisons that wrap past the last segment need the whole ruler, so `is_canonical` still runs on every complete ruler. On the CPU these rules visit about 20% fewer nodes.
 
 ## 5. Splitting the work
 
-`Search::prefixes` expands the search tree breadth first, applying all the pruning and symmetry rules, until a depth has at least `target` partial rulers (prefixes): $2^{16}$ for the CPU and $2^{21}$ for the GPU. It stops at depth $n - 2$ and at $2^{24}$ prefixes. Prefixes come out in lexicographic order, which checkpoints rely on (section 8). Each prefix is then searched to the end independently.
+`Search::prefixes` expands the tree breadth first, with all pruning, until a depth has at least $2^{16}$ (CPU) or $2^{21}$ (GPU) partial rulers, called prefixes. It stops at depth $n - 2$ or $2^{24}$ prefixes. Prefixes are in lexicographic order, which checkpoints rely on.
 
 ## 6. CPU search
 
-- **Dynamic scheduling:** each Rayon thread takes the next unsearched prefix from an atomic counter as soon as it finishes its last one, so there is no barrier between batches. Results go back over a channel to the main thread, which also writes checkpoints.
-- **Bitsets sized by length:** `Bits<W>` is a `[u64; W]` with `W` a const generic, so every loop has a constant bound and unrolls. Positions take `W` words and distances `H` words (only up to $L/2$): `<1, 1>` for $L \le 64$, `<2, 1>` for $L \le 127$, and `<4, 2>` above.
-- **Native instructions:** `.cargo/config.toml` builds with `-C target-cpu=native`, so `count_ones` and `trailing_zeros` compile to `popcnt` and `tzcnt`. Binaries may not run on older CPUs.
-- **Cheap progress counting:** each thread counts nodes locally and adds them to the shared counter (and checks for Ctrl-C) every 65,536 nodes.
+- **Dynamic scheduling:** each Rayon thread takes the next prefix from an atomic counter as soon as it finishes one. Results go over a channel to the main thread, which checkpoints.
+- **Bitsets sized by length:** `Bits<W>` is `[u64; W]` with `W` a const generic, so loops unroll. Positions take `W` words and distances `H`: `<1, 1>` for $L \le 64$, `<2, 1>` for $L \le 127$, `<4, 2>` above.
+- **Native instructions:** `-C target-cpu=native` turns `count_ones` and `trailing_zeros` into `popcnt` and `tzcnt` (about 1.45× faster).
+- **Cheap counting:** threads add their node counts to the shared counter, and check for Ctrl-C, every 65,536 nodes.
 
 ## 7. GPU search
 
-The GPU (through `wgpu`, so Vulkan, Metal, or DirectX 12) runs the same search in a compute shader: each GPU thread searches one prefix in a *slot* that keeps its state between passes. There are $2^{18}$ slots.
+The same search runs in a compute shader (wgpu). Each GPU thread searches one prefix in a *slot* that keeps its state between passes; there are $2^{18}$ slots.
 
 ### The shader
 
-- **Iterative search:** WGSL has no recursion, so the shader keeps an explicit stack: the marks `pos`, the next position to try at each depth `nextp`, and the covered distances at each depth `covs`. Backtracking removes a mark by toggling its bits in `marks` and `rev`.
-- **Same pruning:** the counting bound, the two-shift distance update with one-bit sliding, the last-mark candidates from the two smallest missing distances, and the $s_1 \le s_{n-1}$ range limits.
-- **No rotation or reflection rules:** checking them needs per-depth state indexed by each thread's own depth, which cost more GPU time than the nodes they removed saved. The prefixes handed to the GPU (including those split from its tail, below) are still pruned by these rules on the CPU, which cuts the work at length 94 from 533 to 491 billion nodes. The CPU filters the GPU's rulers with `is_canonical`.
-- **Bitsets in registers:** the bitset width (`WORDS`, 32-bit words for positions, and `HWORDS` for distances up to $L/2$) is substituted into the shader source when its pipeline is built, one pipeline per width. Words are only indexed by constants; a runtime index is turned into a chain of `select`s over all words (`word`), so the compiler keeps the bitsets in registers instead of spilling them to memory.
-- **Driver workarounds:** some forms crash the radv (Mesa) shader compiler and are avoided, such as early returns inside loops and trailing-zero builtins inside loops (the lowest set bit is found with `countOneBits((x & -x) - 1)` instead).
+- **Explicit stack:** WGSL has no recursion, so the shader keeps the marks `pos` and the covered distances per depth `covs`. Backtracking toggles a mark's bits off.
+- **Same pruning:** counting bound, two-shift update, last-mark candidates, and range limits.
+- **Only the first step of the symmetry rules:** after a later segment of 1, the next is at least $s_1$; a new 1 must follow a segment of at least $s_1$. These need no per-depth state. The full rules cost more GPU time than they saved, so they prune the prefixes on the CPU instead, and the CPU filters GPU rulers with `is_canonical`.
+- **Registers, not memory:** the bitset widths (`WORDS`, `HWORDS`) and the segment count (`MARKS`) are substituted into the source per pipeline. Words are indexed only by constants (a runtime index becomes a chain of `select`s), and per-depth arrays hold only `MARKS` entries, so everything stays in registers.
+- **Last mark together:** threads in a subgroup run in lockstep and the last-mark step is costly, so a thread there waits (with subgroup ballots) until 1/8 of its subgroup's searching threads are there too.
+- **Driver workarounds:** forms that crash the radv compiler are avoided, such as early returns and trailing-zero builtins inside loops (the lowest set bit is `countOneBits((x & -x) - 1)`).
 
-### Passes and node budgets
+### Passes
 
-A dispatch that runs too long trips the driver's GPU timeout, so each thread searches at most `node_budget` nodes per pass, then saves its state (depth, marks, next positions, and the prefix's depth: 66 words per slot) and stops. The next pass resumes it. The budget adapts between $2^8$ and $2^{22}$: it doubles when a pass takes under 100 ms (so launches stay cheap) and halves when one takes over 500 ms. Between passes the CPU puts new prefixes in the slots that finished.
+A long dispatch trips the driver's GPU timeout, so each thread searches at most `node_budget` nodes per pass, saves its state (66 words per slot), and stops. The budget doubles when a pass takes under 100 ms and halves over 500 ms, between $2^8$ and $2^{22}$. Between passes the CPU refills finished slots.
 
-### Collecting results
+### Results
 
-Rulers are written to a shared results buffer. A thread reserves space for all its rulers at a mark at once with an atomic add, and gives it back if they do not fit; it then stops and redoes that mark in the next pass. So a ruler is never dropped or reported twice. The 64-bit node count is kept in two 32-bit atomics, carrying into the high word on overflow. Only the rulers and finished slots actually written are copied back.
+A thread reserves room for all its rulers at a mark with one atomic add, and gives it back if they do not fit; it then redoes that mark next pass. So no ruler is dropped or reported twice. The 64-bit node count is two 32-bit atomics with a carry. Only the rulers and finished slots actually written are copied back.
 
 ### Splitting the tail
 
-A few prefixes have far larger subtrees than the rest. At length 94 about a third of the time was spent with only a few hundred slots busy. So once every prefix has started, nothing split is waiting, and at most 1/8 of the slots are busy, the CPU reads the busy slots' saved states back and splits each into what it has left to search (`Search::remaining`):
+A few prefixes have far larger subtrees than the rest. Once every prefix has started and at most 1/8 of slots are busy, the CPU reads the busy slots' states and splits each (`Search::remaining`):
 
-- For each depth $i$ from the prefix's depth to the current depth, every allowed position after the one currently being searched at depth $i$ becomes a new prefix of $i + 1$ marks.
-- If the slot was placing the last mark, its current node is searched again whole, since the last mark is placed all at once.
+- for each depth $i$ from the prefix's depth to the current depth, every allowed position after the current one at depth $i$ becomes a new prefix;
+- a slot placing the last mark is searched again whole, since the last mark is placed at once.
 
-Together these cover exactly the rest of the slot's search, and they fill the idle slots. Each original prefix counts its outstanding pieces and is marked finished when the last one is. This took length 94 from 137 s to 70 s.
+These cover exactly the rest of the slot's search. Each original prefix is finished when its last piece is.
 
-## 8. Checkpoints and resuming
+## 8. Checkpoints
 
-Every 10 seconds, and on Ctrl-C, the state is saved:
+Every 10 seconds and on Ctrl-C the state is saved:
 
-- **What is saved:** the segments of the first prefix not fully searched (`checkpoint_ruler`), the prefixes fully searched after it as ranges of indices (`checkpoint_finished`, since GPU slots finish out of order), the rulers found so far, node counts, and times.
-- **Resuming:** the search is split again the same way, the first unfinished prefix is found by binary search over the sorted prefixes, and the finished ranges are skipped. A resumed run may repeat part of a prefix, so the rulers are sorted and deduplicated at the end.
-- **Cheap saves:** each finished length's JSON is serialized once and cached, and the current length's rulers are serialized as they are found, so a save only serializes what changed. The file is written on a background thread to a temporary file that then replaces the save file, so it is never half written and the search does not wait for it.
+- **Saved:** the segments of the first unfinished prefix (`checkpoint_ruler`), prefixes finished after it as index ranges (`checkpoint_finished`, since GPU slots finish out of order), the rulers so far, node counts, and times.
+- **Resuming:** the search is split the same way, the first unfinished prefix is found by binary search, and finished ranges are skipped. Part of a prefix may repeat, so rulers are deduplicated at the end.
+- **Cheap saves:** finished lengths are serialized once and the current length's rulers as they are found. A background thread writes a temporary file and renames it over the save file.
 
-## 9. Testing
+## 9. Tests
 
-- `matches_brute_force` compares the search with a brute-force enumeration of every composition with $s_0 = 1$, for every length up to 30, at the minimal segment count and the one above it, with 1 and 50 prefixes and with both bitset widths.
-- `remaining_covers_rest_of_search` checks that splitting a search at every depth along its first path finds exactly the rulers of the whole search.
-- `main.rs` tests `is_canonical` and the lower bound, including the perfect-difference-set lengths.
+- `matches_brute_force`: the search against enumerating every composition with $s_0 = 1$, for $L \le 30$, at the minimal segment count and one more, with 1 and 50 prefixes and both bitset widths.
+- `remaining_covers_rest_of_search`: splitting at every depth of the first path finds exactly the whole search's rulers.
+- `finds_ruler_of_length_255`: the widest bitsets reach the top bits.
+- `ruler.rs`: `is_canonical` and the lower bound, including perfect-difference-set lengths.
 
 ## Measured gains
 
-From the README, at length 94 on the GPU:
+On the GPU unless noted.
 
 | Change | Effect |
 | --- | --- |
-| Splitting the GPU tail | 137 s → 70 s |
-| Tracking only half the distances, plus symmetry-pruned prefixes | 70 s → 55 s |
-| Rotation and reflection rules on prefixes | 533 → 491 billion nodes |
+| Splitting the GPU tail | L = 94: 137 s → 70 s |
+| Half the distances, symmetry-pruned prefixes | L = 94: 70 s → 55 s; 533 → 491 billion nodes |
+| Per-depth arrays sized by segment count | L = 130: 20 → 34 billion nodes/s; L = 1–100: 7:29 → 5:44 |
+| First step of the symmetry rules in the shader | L = 132 sample: 1,390 s → 1,246 s; L = 1–100: 5:44 → 5:23 |
+| Last mark taken together | L = 132 sample: 1,246 s → 974 s; L = 1–100: 5:23 → 4:39 |
+| Symmetry rules (CPU) | about 20% fewer nodes |
+| Native `popcnt` (CPU) | about 1.45× faster |
 
-On the CPU, the rotation and reflection rules visit about 20% fewer nodes.
+Tried without gain: full symmetry rules in the shader (fewer nodes, but each slower), per-depth arrays in workgroup memory (half speed with covered distances there), building children's shifted bitsets from the parent's, and keeping every GPU slot busy in the tail (about 3% at best).

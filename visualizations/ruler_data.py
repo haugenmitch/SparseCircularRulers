@@ -32,6 +32,7 @@ NON_DIGITS = bytes(b if chr(b).isdigit() else ord(" ") for b in range(256))
 
 
 def _secs(duration: dict | None) -> float:
+    """A serialized Rust Duration in seconds."""
     if not duration:
         return 0.0
     return duration.get("secs", 0) + duration.get("nanos", 0) / 1e9
@@ -39,6 +40,7 @@ def _secs(duration: dict | None) -> float:
 
 @dataclass
 class LengthResult:
+    """One length's metadata and rulers."""
     length: int
     num_segments: int
     lower_bound: int
@@ -50,6 +52,7 @@ class LengthResult:
 
     @property
     def count(self) -> int:
+        """Number of rulers."""
         return int(self.rulers.shape[0])
 
     @property
@@ -61,19 +64,23 @@ class LengthResult:
 
 @dataclass
 class Results:
+    """Every length of one results file."""
     source: str
     version: str | None
     lengths: dict[int, LengthResult] = field(default_factory=dict)
     total_evaluated: int = 0
 
     def sorted(self) -> list[LengthResult]:
+        """Lengths in order."""
         return [self.lengths[L] for L in sorted(self.lengths)]
 
     def with_rulers(self) -> list[LengthResult]:
+        """Lengths in order that have rulers."""
         return [r for r in self.sorted() if r.count]
 
 
 def _cache_path(path: str, cache_dir: str) -> str:
+    """Cache file for `path`, keyed by its path, size, and mtime."""
     st = os.stat(path)
     key = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}|{CACHE_VERSION}"
     digest = hashlib.sha1(key.encode()).hexdigest()[:12]
@@ -82,11 +89,13 @@ def _cache_path(path: str, cache_dir: str) -> str:
 
 
 def _parse(path: str, with_rulers: bool) -> tuple[dict, list[np.ndarray | None]]:
+    """The file's JSON without rulers, and each rulers array as flat uint16 values."""
     with open(path, "rb") as f:
         raw = f.read()
     blocks: list[bytes] = []
 
     def stash(match: re.Match) -> bytes:
+        """Replace a rulers array with its index in `blocks`."""
         blocks.append(match.group(1))
         return b'"rulers": %d' % (len(blocks) - 1)
 
@@ -120,6 +129,7 @@ def load_results(path: str, cache_dir: str | None = DEFAULT_CACHE_DIR,
     meta, blocks = _parse(path, with_rulers)
 
     def rulers_for(L: int, idx) -> np.ndarray | None:
+        """The flat rulers of block `idx`, if loaded."""
         if not with_rulers or not isinstance(idx, int):
             return None
         return blocks[idx]
@@ -142,6 +152,7 @@ def load_results(path: str, cache_dir: str | None = DEFAULT_CACHE_DIR,
 
 
 def _build(path: str, meta: dict, rulers_for) -> Results:
+    """Results from parsed metadata; `rulers_for` gives each length's flat rulers."""
     results = Results(source=path, version=meta.get("version"),
                       total_evaluated=meta.get("total_rulers_evaluated", 0))
     for key, sol in meta.get("solutions", {}).items():
@@ -170,6 +181,7 @@ def _build(path: str, meta: dict, rulers_for) -> Results:
 # ---------------------------------------------------------------------------
 
 def chunks(n: int, size: int):
+    """Slices of at most `size` covering range(n)."""
     for start in range(0, n, size):
         yield slice(start, min(start + size, n))
 
@@ -298,6 +310,7 @@ def row_hash(rulers: np.ndarray) -> np.ndarray:
 
 
 def _index(rulers: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sorted hashes of canonical forms, for `_match`."""
     canon = canonical(rulers)
     h = row_hash(canon)
     order = np.argsort(h)
